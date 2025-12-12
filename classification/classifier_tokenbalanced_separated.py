@@ -30,22 +30,28 @@ sns.set_style('darkgrid')
 # -----------------------------
 # Configuration
 # -----------------------------
-data_dir = "data/all layers all attention tp fp"
+data_dir = "../data/all layers all attention tp fp"
 base_save_dir = "final_cl_results"
 os.makedirs(base_save_dir, exist_ok=True)
 dataset_path = "cls_data"
+n_files = 3900
 
 #######################
 zero_class = 'tp'
-balanced_train = False
+balanced_train = True
 balanced_test = False
-fp2tp_ratio = 0.7
+fp2tp_ratio = 0.9
 test_thresh = 0.5
-n_files = 3900
-train_size = 0.75
-test_size = 0.25
-pos_condition = False
-###################
+
+train_size = 0.5
+test_size = 0.5
+pos_condition = True
+independent_clfs = True
+
+#######################
+
+if independent_clfs:
+    pos_condition = True
 
 if zero_class == 'tp':
     other_dropout = 0.95
@@ -71,7 +77,7 @@ weight_decay = 1e-3
 dropout_rate = 0.5
 normalize_features = True
 
-sfx = "" if pos_condition else "__no_pos_condition"
+sfx = "_separated_clf" if independent_clfs else ""
 exp_name = f"exp__trainb_{int(balanced_train)}_testb_{int(balanced_test)}_zero_{zero_class}{sfx}"
 save_dir = os.path.join(base_save_dir, exp_name)
 model_dir = os.path.join(save_dir, "model")
@@ -336,8 +342,68 @@ class MLPClassifierTorch(nn.Module):
         )
     def forward(self, x):
         return self.net(x).squeeze(1)
+    
+# --------------------------------------------------------------------
+# Independent-Classifiers Wrapper
+# --------------------------------------------------------------------
+class IndependentClassifier(nn.Module):
+    """
+    Wraps multiple MLPs and dispatches samples to the correct classifier
+    based on the last feature (normalized position).
+    """
+    def __init__(self, input_dim, dropout_rate=0.5,
+                 n_bins=15, min_pos=5, max_pos=155):
+        super().__init__()
 
-clf = MLPClassifierTorch(X_train_t.shape[1], dropout_rate=dropout_rate).to(device)
+        self.n_bins = n_bins
+        self.min_pos = min_pos
+        self.max_pos = max_pos
+        self.bin_width = (max_pos - min_pos) // n_bins
+
+        self.clfs = nn.ModuleList([
+            MLPClassifierTorch(input_dim, dropout_rate=dropout_rate)
+            for _ in range(n_bins)
+        ])
+
+    def get_bin(self, x):
+        """Map normalized positions to classifier bins."""
+        pos = x[:, -1] * self.max_pos              # denormalize
+        pos = torch.clamp(pos, self.min_pos, self.max_pos)
+        bin_ids = ((pos - self.min_pos) / self.bin_width).long()
+        return torch.clamp(bin_ids, 0, self.n_bins - 1)
+
+    def forward(self, x):
+        """
+        Returns logits in the same format as a single classifier.
+        Each sample is routed to its corresponding classifier.
+        """
+        bin_ids = self.get_bin(x)
+        logits = torch.zeros(len(x), device=x.device)
+
+        # dispatch each sample to its proper classifier
+        for b in range(self.n_bins):
+            idx = (bin_ids == b)
+            if torch.any(idx):
+                logits[idx] = self.clfs[b](x[idx])
+        return logits
+
+
+
+# clf = MLPClassifierTorch(X_train_t.shape[1], dropout_rate=dropout_rate).to(device)
+
+if independent_clfs:
+    clf = IndependentClassifier(
+        input_dim=X_train_t.shape[1],
+        dropout_rate=dropout_rate,
+        n_bins=15,
+        min_pos=min_position,
+        max_pos=max_position
+    ).to(device)
+else:
+    clf = MLPClassifierTorch(X_train_t.shape[1], dropout_rate=dropout_rate).to(device)
+
+
+
 criterion = nn.BCEWithLogitsLoss()
 optimizer = optim.Adam(clf.parameters(), lr=1e-3, weight_decay=weight_decay)
 
@@ -471,7 +537,7 @@ plt.close()
 # -----------------------------
 
 # Smoothing kernel
-kernel = np.array([0.05, 0.15, 0.6, 0.15, 0.05])
+kernel = np.array([0.05, 0.1, 0.7, 0.1, 0.05])
 
 
 def smooth(arr, kernel):
