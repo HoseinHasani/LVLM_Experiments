@@ -8,7 +8,7 @@ import seaborn as sns
 from scipy.stats import sem
 from collections import Counter
 
-data_dir = "data/all layers all attention tp fp"
+data_dir = "../data/all layers all attention tp fp"
 files = glob(os.path.join(data_dir, "attentions_*.pkl"))
 n_files = 4000
 n_layers, n_heads = 32, 32
@@ -347,9 +347,9 @@ oth_posmap = aggregate_by_position(oth_data, n_layers, n_heads)
 
 # plot_attention_grid(tp_posmap, fp_posmap, oth_posmap, n_layers, n_heads, savepath="attention_grid.pdf")
 
-# plot_position_histograms(tp_posmap, fp_posmap, oth_posmap)
+plot_position_histograms(tp_posmap, fp_posmap, oth_posmap)
 
-# plot_token_class_composition(tp_posmap, fp_posmap, oth_posmap, n_layers, n_heads)
+plot_token_class_composition(tp_posmap, fp_posmap, oth_posmap, n_layers, n_heads)
 
 plot_avg_attention_over_layers(tp_posmap, fp_posmap, oth_posmap,
                                st_layer=5, end_layer=19,
