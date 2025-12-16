@@ -5,8 +5,11 @@ from glob import glob
 from tqdm import tqdm
 from scipy.stats import ttest_ind
 
+target_rep = 1
+attn_sfx = "_next"
+# attn_sfx = ""
 
-data_dir = "data/all layers all attention tp fp"
+data_dir = "../data/all layers all attention tp fp rep double"
 files = glob(os.path.join(data_dir, "attentions_*.pkl"))
 
 n_files = 3900
@@ -19,7 +22,7 @@ position_min = 5
 position_max = 160
 position_margin = 3
 
-save_root = "stats_summary"
+save_root = f"stats_summary_{target_rep}{attn_sfx}"
 os.makedirs(save_root, exist_ok=True)
 
 
@@ -47,8 +50,16 @@ def extract_attention_values(data_dict, cls_):
     for e in entries:
         if not e.get("subtoken_results"):
             continue
+        
+        if target_rep == 1:
+            if e['rep_num'] != 1:
+                continue
+        else:
+            if e['rep_num'] == 1:
+                continue
+            
         for sub in e["subtoken_results"][:n_subtokens]:
-            vals = np.array(sub["topk_values"], dtype=float)
+            vals = np.array(sub[f"topk_values{attn_sfx}"], dtype=float)
             if vals.ndim != 3:
                 continue
 
