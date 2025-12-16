@@ -49,7 +49,6 @@ else:
     other_dropout = 0.2
     tp_dropout = 0.0    
 
-use_text_attentions = False
 n_layers, n_heads = 32, 32
 min_position = 5
 max_position = 155
@@ -85,54 +84,121 @@ def compute_entropy(values):
     return -np.sum(prob * np.log(prob + eps), axis=-1)
 
 
-def extract_attention_values(data_dict, cls_, source="image"):
+def logit_entropy(logits, k=100, eps=1e-10):
+    logits = logits.astype(np.float32)
+    
+
+    topk_logits = np.partition(logits, -k)[-k:]
+    topk_logits -= np.max(topk_logits)
+
+    probs = np.exp(topk_logits)
+    probs /= probs.sum() + eps
+
+    return -np.sum(probs * np.log(probs + eps))
+
+def softmax(x, eps=1e-10):
+    x = x - np.max(x)
+    exp_x = np.exp(x)
+    return exp_x / (np.sum(exp_x) + eps)
+
+
+def extract_attention_score_values(attn_dict, score_dict, cls_, source="image"):
     results = []
-    entries = data_dict.get(cls_, {}).get(source, [])
-    for e in entries:
-        if not e.get("subtoken_results"):
+    attn_entries = attn_dict.get(cls_, {}).get(source, [])
+    score_entries = score_dict.get(cls_, {})
+    
+    for k in range(min(len(attn_entries), len(score_entries))):
+        
+        a_e = attn_entries[k]
+        s_e = score_entries[k]
+        
+        
+        if len(a_e['token_indices']) < 1:
             continue
-        for sub in e["subtoken_results"][:n_subtokens]:
-            topk_vals = np.array(sub["topk_values"], dtype=float)
-            if topk_vals.ndim != 3:
+        
+        if target_rep == 1:
+            if a_e['rep_num'] != 1:
                 continue
-            idx = int(sub["idx"])
-            results.append((idx, topk_vals[..., :n_top_k]))
+        else:
+            if a_e['rep_num'] == 1:
+                continue
+        
+        a_idx = a_e['token_indices'][0]
+        s_idx = s_e[0]
+        logits = np.sort(s_e[1])[-100:]
+    
+        if a_idx != s_idx:
+            continue
+        
+        topk_vals = np.array(a_e["subtoken_results"][0]["topk_values"], dtype=float)
+        if topk_vals.ndim != 3:
+            continue
+        
+        topk_vals_next = np.array(a_e["subtoken_results"][0]["topk_values_next"], dtype=float)
+        if topk_vals_next.ndim != 3:
+            continue
+        
+        results.append((a_idx, topk_vals[..., :n_top_k], topk_vals_next[..., :n_top_k], logits))
+        
     return results
 
 
-def extract_all_features(files, n_files, n_layers, n_heads, min_position, max_position):
+def extract_all_features(attn_file_dict, score_file_dict, file_ids, n_layers, n_heads, min_position, max_position):
     X, y, pos_list, cls_list = [], [], [], []
-    for f in tqdm(files[:n_files], desc="Extracting features"):
+
+    for j in tqdm(range(len(file_ids)), desc="Extracting features"):
+        file_id = file_ids[j]
+        at_f = attn_files_dict[file_id]
+        sc_f = score_file_dict[file_id]
+
         try:
-            with open(f, "rb") as handle:
-                data_dict = pickle.load(handle)
+            with open(at_f, "rb") as handle:
+                attn_data_dict = pickle.load(handle)
+        except Exception:
+            continue
+        
+        try:
+            with open(sc_f, "rb") as handle:
+                score_data_dict = pickle.load(handle)
         except Exception:
             continue
 
         for cls_, label in [("fp", 0), ("tp", 1), ("other", 1)]:
-            img_samples = extract_attention_values(data_dict, cls_, "image")
-            txt_samples = extract_attention_values(data_dict, cls_, "text") if use_text_attentions else []
+            img_samples = extract_attention_score_values(attn_data_dict, score_data_dict, cls_, "image")
             all_samples = []
             if img_samples:
                 all_samples.extend([("image", *s) for s in img_samples])
-            if use_text_attentions and txt_samples:
-                all_samples.extend([("text", *s) for s in txt_samples])
 
-            for src, idx, topk_arr in all_samples:
+
+            for src, idx, topk_arr1, topk_arr2, logits in all_samples:
                 token_pos = int(idx)
                 if token_pos < min_position or token_pos > max_position:
                     continue
 
                 features = []
+                
                 for l in range(n_layers):
                     for h in range(n_heads):
-                        vals = topk_arr[l, h, :]
-                        mean_attention = np.mean(vals)
-                        features.append(mean_attention)
+                        vals1 = topk_arr1[l, h, :]
+                        vals2 = topk_arr2[l, h, :]
+                        mean_attention1 = np.mean(vals1)
+                        mean_attention2 = np.mean(vals2)
+                        features.append(mean_attention1)
+                        features.append(mean_attention2)
+                        
                         if use_entropy:
-                            features.append(compute_entropy(vals))
-                if use_text_attentions:
-                    features.append(1.0 if src == "text" else 0.0)
+                            features.append(compute_entropy(vals1))
+                            features.append(compute_entropy(vals2))
+                            
+                            
+                # logit featuers:
+                ent = logit_entropy(logits)
+                max_logit = float(np.max(logits))
+                max_softmax = float(np.max(softmax(logits)))
+                
+                features.append([ent, max_logit, max_softmax])
+                
+                # normalized token position:
                 features.append(token_pos / max_position)
 
                 X.append(features)
@@ -225,22 +291,23 @@ def drop_samples(X, y, pos, cls, target="other", dropout_ratio=0.5):
 attn_files = sorted(glob(os.path.join(attn_dir, "attentions_*.pkl")))
 score_files = sorted(glob(os.path.join(score_dir, "scores_*.pkl")))
 
-attn_files_dict = {
-    int(os.path.splitext(os.path.basename(f))[0].split('_')[1]): f
-    for f in attn_files
-}
+attn_files_dict = {}
+for f in attn_files:
+    key = int(os.path.splitext(os.path.basename(f))[0].split('_')[1])
+    attn_files_dict[key] = f
 
-score_files_dict = {
-    int(os.path.splitext(os.path.basename(f))[0].split('_')[1]): f
-    for f in score_files
-}
+score_files_dict = {}
+for f in score_files:
+    key = int(os.path.splitext(os.path.basename(f))[0].split('_')[1])
+    score_files_dict[key] = f
+
 
 attn_ids = list(attn_files_dict.keys())
 attn_ids = list(score_files_dict.keys())
 
 intersect_ids = list(set(attn_files_dict).intersection(set(score_files_dict)))
 
-
+n_files = len(intersect_ids)
 
 
 if dataset_path and os.path.exists(f"{dataset_path}/x.npy"):
@@ -252,7 +319,7 @@ if dataset_path and os.path.exists(f"{dataset_path}/x.npy"):
     cls_all = np.load(f"{dataset_path}/cls.npy")
 else:
     X_all, y_all, pos_all, cls_all = extract_all_features(
-        attn_files_dict, score_files_dict, n_files, n_layers, n_heads, min_position, max_position
+        attn_files_dict, score_files_dict, intersect_ids, n_layers, n_heads, min_position, max_position
     )
 
     if X_all is not None:
