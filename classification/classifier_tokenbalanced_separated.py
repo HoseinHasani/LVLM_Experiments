@@ -316,20 +316,27 @@ print(f"Test size:  {len(y_test)} | FP={np.sum(y_test==1)}, Non-FP={np.sum(y_tes
 
 
 # -----------------------------
-# Torch Model
+# Prepare Torch tensors & normalization
 # -----------------------------
+
 X_train_t = torch.tensor(X_train, dtype=torch.float32)
 y_train_t = torch.tensor(y_train, dtype=torch.long)
 X_test_t = torch.tensor(X_test, dtype=torch.float32)
 y_test_t = torch.tensor(y_test, dtype=torch.long)
+
 if normalize_features:
     mean, std = X_train_t.mean(0, keepdim=True), X_train_t.std(0, keepdim=True) + 1e-6
     X_train_t, X_test_t = (X_train_t - mean) / std, (X_test_t - mean) / std
     torch.save({"mean": mean, "std": std}, os.path.join(model_dir, "scaler.pt"))
 
+
 train_loader = DataLoader(TensorDataset(X_train_t, y_train_t), batch_size=64, shuffle=True)
 test_loader = DataLoader(TensorDataset(X_test_t, y_test_t), batch_size=128, shuffle=False)
 
+
+# -----------------------------
+# MLP building block 
+# -----------------------------
 class MLPClassifierTorch(nn.Module):
     def __init__(self, input_dim, hidden1=512, hidden2=64, dropout_rate=0.5):
         super().__init__()
@@ -342,71 +349,160 @@ class MLPClassifierTorch(nn.Module):
         )
     def forward(self, x):
         return self.net(x).squeeze(1)
-    
-# --------------------------------------------------------------------
-# Independent-Classifiers Wrapper
-# --------------------------------------------------------------------
+
+
+# -----------------------------
+# Independent-classifiers wrapper
+# -----------------------------
 class IndependentClassifier(nn.Module):
     """
-    Wraps multiple MLPs and dispatches samples to the correct classifier
-    based on the last feature (normalized position).
+    Wrap multiple MLPs and dispatch samples to the correct classifier
+    based on the last feature (normalized position). The wrapper expects
+    the last column to be the normalized token position (same column used
+    by the rest of the code).
     """
-    def __init__(self, input_dim, dropout_rate=0.5,
-                 n_bins=15, min_pos=5, max_pos=155):
+    def __init__(
+        self,
+        input_dim,
+        dropout_rate=0.5,
+        n_bins=15,
+        min_pos=5,
+        max_pos=155,
+        pos_norm_min=0.0,
+        pos_norm_max=1.0
+    ):
         super().__init__()
+        self.n_bins = int(n_bins)
+        self.min_pos = float(min_pos)
+        self.max_pos = float(max_pos)
+        # bin_width expressed in original position units (e.g., 10)
+        self.bin_width = (self.max_pos - self.min_pos) / float(self.n_bins)
 
-        self.n_bins = n_bins
-        self.min_pos = min_pos
-        self.max_pos = max_pos
-        self.bin_width = (max_pos - min_pos) // n_bins
+        # normalized bounds of the last feature in the training set
+        self.pos_norm_min = float(pos_norm_min)
+        self.pos_norm_max = float(pos_norm_max)
 
+        # create one classifier per bin
         self.clfs = nn.ModuleList([
             MLPClassifierTorch(input_dim, dropout_rate=dropout_rate)
-            for _ in range(n_bins)
+            for _ in range(self.n_bins)
         ])
 
+    def _denormalize_pos(self, pos_norm):
+        """
+        Map normalized last-feature values back to original token positions.
+        pos_norm: tensor of shape (N,)
+        returns: tensor of original positions in [.min_pos, .max_pos]
+        """
+        # handle degenerate case
+        if self.pos_norm_max == self.pos_norm_min:
+            # fallback: treat everything as mid-point
+            mid = 0.5 * (self.min_pos + self.max_pos)
+            return torch.full_like(pos_norm, fill_value=mid)
+
+        # linear map: pos = min_pos + (pos_norm - norm_min) / (norm_max - norm_min) * (max_pos - min_pos)
+        scaled = (pos_norm - self.pos_norm_min) / (self.pos_norm_max - self.pos_norm_min)
+        pos = self.min_pos + scaled * (self.max_pos - self.min_pos)
+        return pos
+
     def get_bin(self, x):
-        """Map normalized positions to classifier bins."""
-        pos = x[:, -1] * self.max_pos              # denormalize
-        pos = torch.clamp(pos, self.min_pos, self.max_pos)
-        bin_ids = ((pos - self.min_pos) / self.bin_width).long()
-        return torch.clamp(bin_ids, 0, self.n_bins - 1)
+        """
+        Map normalized positions to classifier bin indices [0, n_bins-1].
+        Expects x shape (N, D) and last column is the normalized position feature.
+        """
+        pos_norm = x[:, -1]
+        pos = self._denormalize_pos(pos_norm)
+        # Compute bin id: floor((pos - min_pos)/bin_width)
+        # Using clamp to ensure indices in bounds.
+        relative = (pos - self.min_pos) / (self.bin_width + 1e-12)
+        bin_ids = torch.floor(relative).long()
+        bin_ids = torch.clamp(bin_ids, 0, self.n_bins - 1)
+        return bin_ids
 
     def forward(self, x):
         """
-        Returns logits in the same format as a single classifier.
-        Each sample is routed to its corresponding classifier.
+        Returns logits for each sample (same signature as the single-MLP).
         """
+        device = x.device
         bin_ids = self.get_bin(x)
-        logits = torch.zeros(len(x), device=x.device)
+        logits = torch.zeros(x.shape[0], device=device)
 
-        # dispatch each sample to its proper classifier
+        # dispatch per-bin
         for b in range(self.n_bins):
-            idx = (bin_ids == b)
-            if torch.any(idx):
-                logits[idx] = self.clfs[b](x[idx])
+            mask = (bin_ids == b)
+            if torch.any(mask):
+                xb = x[mask]
+                logits[mask] = self.clfs[b](xb)
         return logits
 
 
+# -----------------------------
+# Instantiate model (single or independent)
+# -----------------------------
 
-# clf = MLPClassifierTorch(X_train_t.shape[1], dropout_rate=dropout_rate).to(device)
+input_dim = X_train_t.shape[1]
 
 if independent_clfs:
+    
+    def clone_mlp_weights(src: nn.Module, dst: nn.Module):
+        """Copy weights from one MLPClassifierTorch to another."""
+        dst.load_state_dict(src.state_dict())
+    
+    pos_norm_min = float(X_train_t[:, -1].min().item())
+    pos_norm_max = float(X_train_t[:, -1].max().item())
+
+
+    print("\n[Stage 1] Pretraining global classifier...")
+    global_clf = MLPClassifierTorch(
+        input_dim=input_dim,
+        dropout_rate=dropout_rate
+    ).to(device)
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.Adam(
+        global_clf.parameters(),
+        lr=1e-3,
+        weight_decay=weight_decay
+    )
+
+    for epoch in range(1):
+        global_clf.train()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.float().to(device)
+            optimizer.zero_grad()
+            loss = criterion(global_clf(xb), yb)
+            loss.backward()
+            optimizer.step()
+
+    # --------------------------------------------------
+    # Stage 2: build independent classifiers
+    # --------------------------------------------------
+    print("[Stage 2] Initializing independent classifiers from pretrained weights...")
+
     clf = IndependentClassifier(
-        input_dim=X_train_t.shape[1],
+        input_dim=input_dim,
         dropout_rate=dropout_rate,
         n_bins=15,
         min_pos=min_position,
-        max_pos=max_position
+        max_pos=max_position,
+        pos_norm_min=pos_norm_min,
+        pos_norm_max=pos_norm_max
     ).to(device)
+
+    # copy pretrained weights into each sub-classifier
+    for sub_clf in clf.clfs:
+        clone_mlp_weights(global_clf, sub_clf)
+        
 else:
-    clf = MLPClassifierTorch(X_train_t.shape[1], dropout_rate=dropout_rate).to(device)
-
-
+    clf = MLPClassifierTorch(input_dim, dropout_rate=dropout_rate).to(device)
 
 criterion = nn.BCEWithLogitsLoss()
 optimizer = optim.Adam(clf.parameters(), lr=1e-3, weight_decay=weight_decay)
 
+
+# -----------------------------
+# Training loop 
+# -----------------------------
 train_losses, test_losses = [], []
 print(f"\nTraining PyTorch MLP for {n_epochs} epochs...")
 for epoch in range(n_epochs):
@@ -448,6 +544,7 @@ with torch.no_grad():
 y_probs = np.array(y_probs).flatten()
 y_pred = (y_probs > test_thresh).astype(int)
 y_true = np.array(y_true)
+
 
 precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary')
 acc = accuracy_score(y_true, y_pred)
