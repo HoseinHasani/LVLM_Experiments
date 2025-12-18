@@ -2,8 +2,8 @@ import os
 import numpy as np
 from glob import glob
 
-stats_root = "stats_summary"   # folder created previously
-metrics = ["attention", "entropy", "gini"]
+stats_root = "stats_summary_1_next"   # folder created previously
+metrics = ["attention", "entropy"]#, "gini"]
 
 position_min = 5
 position_max = 160
@@ -14,7 +14,7 @@ s_pool = 3      # stride
 n_layers = 32
 n_heads = 32
 
-save_output_dir = "stats_summary"
+save_output_dir = stats_root
 
 
 # ------------------------------
