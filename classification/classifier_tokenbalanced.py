@@ -38,9 +38,9 @@ n_files = 3900
 
 #######################
 zero_class = 'tp'
-balanced_train = True
+balanced_train = False
 balanced_test = False
-fp2tp_ratio = 0.9
+fp2tp_ratio = 0.99
 test_thresh = 0.5
 
 train_size = 0.5
@@ -49,11 +49,11 @@ pos_condition = True
 #######################
 
 if zero_class == 'tp':
-    other_dropout = 0.95
+    other_dropout = 0.99
     tp_dropout = 0.0
 elif zero_class == 'other':
     other_dropout = 0.0
-    tp_dropout = 0.95
+    tp_dropout = 0.99
 else:
     other_dropout = 0.2
     tp_dropout = 0.0    
@@ -118,7 +118,7 @@ def extract_all_features(files, n_files, n_layers, n_heads, min_position, max_po
         except Exception:
             continue
 
-        for cls_, label in [("fp", 1), ("tp", 0), ("other", 0)]:
+        for cls_, label in [("fp", 0), ("tp", 1), ("other", 1)]:
             img_samples = extract_attention_values(data_dict, cls_, "image")
             txt_samples = extract_attention_values(data_dict, cls_, "text") if use_text_attentions else []
             all_samples = []
@@ -174,10 +174,10 @@ def compute_adaptive_fp_replication_factors(y_all, pos_all, win=5):
 
         n_0 = np.sum(np.array(local_labels) == 0)
         n_1 = np.sum(np.array(local_labels) == 1)
-        if n_1 == 0:
-            replication_factors[j] = 1
+        if n_0 == 0:
+            replication_factors[j] = 10
         else:
-            replication_factors[j] = max(int(fp2tp_ratio * np.round(n_0 / n_1)), 1)
+            replication_factors[j] = max(int(fp2tp_ratio * np.round(n_1 / n_0)), 1)
 
     print(f"Computed adaptive replication factors for positions {min_pos}–{max_pos}")
     return replication_factors
@@ -188,7 +188,7 @@ def balance_fp_samples_adaptive(X, y, pos, cls, fp_factors):
     X_bal, y_bal, pos_bal, cls_bal = [X], [y], [pos], [cls]
 
     for p, factor in fp_factors.items():
-        mask = (y == 1) & (pos == p)
+        mask = (y == 0) & (pos == p)
         if np.any(mask) and factor > 1:
             X_rep = np.repeat(X[mask], factor, axis=0)
             y_rep = np.repeat(y[mask], factor, axis=0)
@@ -306,8 +306,8 @@ if balanced_test:
 
 
 
-print(f"Train size: {len(y_train)} | FP={np.sum(y_train==1)}, Non-FP={np.sum(y_train==0)}")
-print(f"Test size:  {len(y_test)} | FP={np.sum(y_test==1)}, Non-FP={np.sum(y_test==0)}")
+print(f"Train size: {len(y_train)} | TP={np.sum(y_train==1)}, FP={np.sum(y_train==0)}")
+print(f"Test size:  {len(y_test)} | TP={np.sum(y_test==1)}, FP={np.sum(y_test==0)}")
 
 
 # -----------------------------
