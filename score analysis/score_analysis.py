@@ -34,42 +34,44 @@ def softmax(x):
     return exp_x / (np.sum(exp_x) + eps)
 
 def entropy_topk(logits, k=10):
-    """
-    Entropy of top-K softmax probabilities.
-    """
-    probs = softmax(logits)
-    topk = np.sort(probs)[-k:]
-    topk = topk / (np.sum(topk) + eps)
-    return -np.sum(topk * np.log(topk + eps))
+    logits = logits.astype(np.float32)
+
+    topk_logits = np.partition(logits, -k)[-k:]
+    topk_logits -= np.max(topk_logits)
+
+    probs = np.exp(topk_logits)
+    probs /= probs.sum() + 1e-12
+
+    return -np.sum(probs * np.log(probs + 1e-12))
 
 # =========================
 # Data extraction
 # =========================
 
 def extract_logit_metrics(data_dict, cls_, topk=10):
-    """
-    Extract (position, entropy, max_logit, max_softmax)
-    """
     results = []
     entries = data_dict.get(cls_, [])
 
-    for entry in entries:
-        if len(entry) != 2:
-            continue
-
-        pos, logits = entry
+    for pos, logits in entries:
         logits = np.asarray(logits).squeeze()
-
         if logits.ndim != 1:
             continue
+
+        logits = logits.astype(np.float32)
 
         ent = entropy_topk(logits, k=topk)
         max_logit = float(np.max(logits))
         max_softmax = float(np.max(softmax(logits)))
 
+        if not np.isfinite(ent):
+            continue
+        if not np.isfinite(max_logit) or not np.isfinite(max_softmax):
+            continue
+
         results.append((int(pos), ent, max_logit, max_softmax))
 
     return results
+
 
 
 def aggregate_scores_across_files(files, n_files, topk=10):
@@ -172,51 +174,46 @@ def plot_metric(tp_map, fp_map, oth_map,
     plt.savefig(savepath, dpi=140)
     plt.show()
 
-# =========================
-# Main
-# =========================
 
-if __name__ == "__main__":
+files = sorted(glob(os.path.join(data_dir, file_pattern)))
+print(f"Found {len(files)} score files")
 
-    files = sorted(glob(os.path.join(data_dir, file_pattern)))
-    print(f"Found {len(files)} score files")
+tp_scores, fp_scores, oth_scores = aggregate_scores_across_files(
+    files, n_files=n_files, topk=topk_entropy
+)
 
-    tp_scores, fp_scores, oth_scores = aggregate_scores_across_files(
-        files, n_files=n_files, topk=topk_entropy
-    )
+# ---- Entropy ----
+tp_ent = build_posmap(tp_scores, 1)
+fp_ent = build_posmap(fp_scores, 1)
+oth_ent = build_posmap(oth_scores, 1)
 
-    # ---- Entropy ----
-    tp_ent = build_posmap(tp_scores, 1)
-    fp_ent = build_posmap(fp_scores, 1)
-    oth_ent = build_posmap(oth_scores, 1)
+plot_metric(
+    tp_ent, fp_ent, oth_ent,
+    ylabel="Entropy (Top-10 Softmax)",
+    title="Entropy of Token Predictions (TP vs FP)",
+    savepath="score_entropy_tp_fp.png"
+)
 
-    plot_metric(
-        tp_ent, fp_ent, oth_ent,
-        ylabel="Entropy (Top-10 Softmax)",
-        title="Entropy of Token Predictions (TP vs FP)",
-        savepath="score_entropy_tp_fp.png"
-    )
+# ---- Max Logit ----
+tp_ml = build_posmap(tp_scores, 2)
+fp_ml = build_posmap(fp_scores, 2)
+oth_ml = build_posmap(oth_scores, 2)
 
-    # ---- Max Logit ----
-    tp_ml = build_posmap(tp_scores, 2)
-    fp_ml = build_posmap(fp_scores, 2)
-    oth_ml = build_posmap(oth_scores, 2)
+plot_metric(
+    tp_ml, fp_ml, oth_ml,
+    ylabel="Max Logit",
+    title="Maximum Logit per Token (TP vs FP)",
+    savepath="score_max_logit_tp_fp.png"
+)
 
-    plot_metric(
-        tp_ml, fp_ml, oth_ml,
-        ylabel="Max Logit",
-        title="Maximum Logit per Token (TP vs FP)",
-        savepath="score_max_logit_tp_fp.png"
-    )
+# ---- Max Softmax ----
+tp_ms = build_posmap(tp_scores, 3)
+fp_ms = build_posmap(fp_scores, 3)
+oth_ms = build_posmap(oth_scores, 3)
 
-    # ---- Max Softmax ----
-    tp_ms = build_posmap(tp_scores, 3)
-    fp_ms = build_posmap(fp_scores, 3)
-    oth_ms = build_posmap(oth_scores, 3)
-
-    plot_metric(
-        tp_ms, fp_ms, oth_ms,
-        ylabel="Max Softmax Probability",
-        title="Maximum Softmax Probability per Token (TP vs FP)",
-        savepath="score_max_softmax_tp_fp.png"
-    )
+plot_metric(
+    tp_ms, fp_ms, oth_ms,
+    ylabel="Max Softmax Probability",
+    title="Maximum Softmax Probability per Token (TP vs FP)",
+    savepath="score_max_softmax_tp_fp.png"
+)
