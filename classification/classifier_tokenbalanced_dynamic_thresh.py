@@ -117,7 +117,7 @@ def extract_all_features(files, n_files, n_layers, n_heads, min_position, max_po
         except Exception:
             continue
 
-        for cls_, label in [("fp", 1), ("tp", 0), ("other", 0)]:
+        for cls_, label in [("fp", 0), ("tp", 1), ("other", 1)]:
             img_samples = extract_attention_values(data_dict, cls_, "image")
             txt_samples = extract_attention_values(data_dict, cls_, "text") if use_text_attentions else []
             all_samples = []
@@ -173,10 +173,10 @@ def compute_adaptive_fp_replication_factors(y_all, pos_all, win=5):
 
         n_0 = np.sum(np.array(local_labels) == 0)
         n_1 = np.sum(np.array(local_labels) == 1)
-        if n_1 == 0:
-            replication_factors[j] = 1
+        if n_0 == 0:
+            replication_factors[j] = 10
         else:
-            replication_factors[j] = max(int(fp2tp_ratio * np.round(n_0 / n_1)), 1)
+            replication_factors[j] = max(int(fp2tp_ratio * np.round(n_1 / n_0)), 1)
 
     print(f"Computed adaptive replication factors for positions {min_pos}–{max_pos}")
     return replication_factors
@@ -187,7 +187,7 @@ def balance_fp_samples_adaptive(X, y, pos, cls, fp_factors):
     X_bal, y_bal, pos_bal, cls_bal = [X], [y], [pos], [cls]
 
     for p, factor in fp_factors.items():
-        mask = (y == 1) & (pos == p)
+        mask = (y == 0) & (pos == p)
         if np.any(mask) and factor > 1:
             X_rep = np.repeat(X[mask], factor, axis=0)
             y_rep = np.repeat(y[mask], factor, axis=0)
@@ -224,6 +224,7 @@ def drop_samples(X, y, pos, cls, target="other", dropout_ratio=0.5):
 
     print(f"Dropped {np.sum(~keep_mask)} / {len(cls)} ('{target}' samples removed: {100*dropout_ratio:.1f}%)")
     return X[keep_mask], y[keep_mask], pos[keep_mask], cls[keep_mask]
+
 
 
 
@@ -297,7 +298,7 @@ pos_min, pos_max = min_position, max_position
 optimal_thresholds = {}
 for p in range(pos_min, pos_max + 1):
     r = train_fp_factors.get(p, 1)
-    optimal_thresholds[p] = r / (1.0 + r)
+    optimal_thresholds[p] = 1.0 / (1.0 + r)
 
 # Optional: smooth thresholds to avoid jagged behavior
 def smooth_dict(d, win=3):
@@ -324,8 +325,8 @@ if balanced_test:
 
 
 
-print(f"Train size: {len(y_train)} | FP={np.sum(y_train==1)}, Non-FP={np.sum(y_train==0)}")
-print(f"Test size:  {len(y_test)} | FP={np.sum(y_test==1)}, Non-FP={np.sum(y_test==0)}")
+print(f"Train size: {len(y_train)} | TP={np.sum(y_train==1)}, FP={np.sum(y_train==0)}")
+print(f"Test size:  {len(y_test)} | TP={np.sum(y_test==1)}, FP={np.sum(y_test==0)}")
 
 
 # -----------------------------
@@ -350,8 +351,8 @@ def denormalize_position_minmax(
     pos_norm,
     pos_norm_min,
     pos_norm_max,
-    pos_min=5,
-    pos_max=150
+    pos_min=min_position,
+    pos_max=max_position
 ):
     return (
         (pos_norm - pos_norm_min)
