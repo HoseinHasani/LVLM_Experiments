@@ -21,8 +21,8 @@ from collections import defaultdict
 #######################
 target_rep = 1
 
-n_select_att = 15     
-n_select_ent = 20
+n_select_att = 128 // target_rep
+n_select_ent = 64 // target_rep
 
 target_class = 'tp'
 balanced_train = True
@@ -36,12 +36,14 @@ use_logits = True
 use_attns = True
 #######################
 
+select = f"s_{n_select_att}_{n_select_ent}"
+
 attn_dir = "../../data/all layers all attention tp fp rep double"
 score_dir = "../../data/double_scores"
 
 base_save_dir = "final_cl_results"
 os.makedirs(base_save_dir, exist_ok=True)
-dataset_path = f"cls_data_{target_rep}"
+dataset_path = f"cls_data_{target_rep}_{select}"
 # n_files = 3900
 
 if target_class == 'tp':
@@ -71,7 +73,7 @@ sfx = ""
 sfx = sfx if use_logits else sfx + "_no_logits"
 sfx = sfx if use_attns else sfx + "_no_attns"
 
-exp_name = f"exp__bayes_ce{sfx}"
+exp_name = f"exp__selected_bayes_ce{sfx}"
 save_dir = os.path.join(base_save_dir, exp_name)
 model_dir = os.path.join(save_dir, "model")
 results_dir = os.path.join(save_dir, "results")
@@ -81,24 +83,33 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"\nUsing device: {device}")
 
 
+stat_path = f"../../statistical tests/stats_summary_{target_rep}"
 
-agg_att = np.load("stats_summary/attention_aggregated.npy", allow_pickle=True).item()
-agg_ent = np.load("stats_summary/entropy_aggregated.npy", allow_pickle=True).item()
 
 # Convert dict keys "L_i_H_j" → tuple (i,j)
 def parse_key(k):
     parts = k.split("_")
     return int(parts[1]), int(parts[3])
 
-# Sort by ascending score (because minimum-pooled values: small = more distinguishable)
+
+agg_att = np.load(f"{stat_path}/attention_aggregated.npy", allow_pickle=True).item()
+agg_ent = np.load(f"{stat_path}/entropy_aggregated.npy", allow_pickle=True).item()
+
 sorted_att = sorted(agg_att.items(), key=lambda x: x[1])
 sorted_ent = sorted(agg_ent.items(), key=lambda x: x[1])
 
 best_att_heads = [parse_key(k) for k, v in sorted_att[:n_select_att]]
 best_ent_heads = [parse_key(k) for k, v in sorted_ent[:n_select_ent]]
 
-print(f"Selected {len(best_att_heads)} attention heads")
-print(f"Selected {len(best_ent_heads)} entropy heads")
+
+agg_att = np.load(f"{stat_path}_next/attention_aggregated.npy", allow_pickle=True).item()
+agg_ent = np.load(f"{stat_path}_next/entropy_aggregated.npy", allow_pickle=True).item()
+
+sorted_att = sorted(agg_att.items(), key=lambda x: x[1])
+sorted_ent = sorted(agg_ent.items(), key=lambda x: x[1])
+
+best_att_heads_next = [parse_key(k) for k, v in sorted_att[:n_select_att]]
+best_ent_heads_next = [parse_key(k) for k, v in sorted_ent[:n_select_ent]]
 
 
 # -----------------------------
@@ -206,17 +217,23 @@ def extract_all_features(attn_file_dict, score_file_dict, file_ids, n_layers, n_
                 features = []
                 
                 
-                # Extract only selected attention heads
                 for (l, h) in best_att_heads:
-                    vals1 = topk_arr1[l, h, :]
-                    features.append(np.mean(vals1))     # attention mean
+                    vals = topk_arr1[l, h, :]
+                    features.append(np.mean(vals))     
                 
-                # Extract only selected entropy heads
                 if use_entropy:
                     for (l, h) in best_ent_heads:
-                        vals1 = topk_arr1[l, h, :]
-                        features.append(compute_entropy(vals1))
+                        vals = topk_arr1[l, h, :]
+                        features.append(compute_entropy(vals))
         
+                for (l, h) in best_att_heads_next:
+                    vals = topk_arr2[l, h, :]
+                    features.append(np.mean(vals))     
+                
+                if use_entropy:
+                    for (l, h) in best_ent_heads_next:
+                        vals = topk_arr2[l, h, :]
+                        features.append(compute_entropy(vals))
                 
                             
                 # logit featuers:
@@ -354,7 +371,6 @@ else:
     )
 
     if X_all is not None:
-        dataset_path = f"cls_data_{target_rep}"
         os.makedirs(dataset_path, exist_ok=True)
         np.save(os.path.join(dataset_path, "x.npy"), X_all)
         np.save(os.path.join(dataset_path, "y.npy"), y_all)
