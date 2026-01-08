@@ -1,7 +1,6 @@
 import os
 import pickle
 import numpy as np
-import seaborn as sns
 from glob import glob
 from tqdm import tqdm
 
@@ -12,14 +11,28 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from collections import defaultdict
 
-target_rep = 1
 
-sns.set_style('darkgrid')
-# sns.set_palette('bright')
 
 # -----------------------------
 # Configuration
 # -----------------------------
+
+
+#######################
+target_rep = 1
+
+target_class = 'tp'
+balanced_train = True
+balanced_test = False
+fp2tp_ratio = 1.0
+
+train_size = 0.5
+test_size = 0.5
+pos_condition = True
+use_logits = True
+use_attns = True
+#######################
+
 attn_dir = "../../data/all layers all attention tp fp rep double"
 score_dir = "../../data/double_scores"
 
@@ -28,21 +41,10 @@ os.makedirs(base_save_dir, exist_ok=True)
 dataset_path = f"cls_data_{target_rep}"
 # n_files = 3900
 
-#######################
-zero_class = 'tp'
-balanced_train = True
-balanced_test = False
-fp2tp_ratio = 1.0
-
-train_size = 0.5
-test_size = 0.5
-pos_condition = True
-#######################
-
-if zero_class == 'tp':
+if target_class == 'tp':
     other_dropout = 1
     tp_dropout = 0.0
-elif zero_class == 'other':
+elif target_class == 'other':
     other_dropout = 0.0
     tp_dropout = 1
 else:
@@ -62,8 +64,11 @@ weight_decay = 1e-3
 dropout_rate = 0.5
 normalize_features = True
 
-sfx = "" if pos_condition else "__no_pos_condition"
-exp_name = f"exp__bayes_ce_{target_rep}_{sfx}"
+sfx = ""
+sfx = sfx if use_logits else sfx + "_no_logits"
+sfx = sfx if use_attns else sfx + "_no_attns"
+
+exp_name = f"exp__bayes_ce{sfx}"
 save_dir = os.path.join(base_save_dir, exp_name)
 model_dir = os.path.join(save_dir, "model")
 results_dir = os.path.join(save_dir, "results")
@@ -196,7 +201,7 @@ def extract_all_features(attn_file_dict, score_file_dict, file_ids, n_layers, n_
                 max_logit = float(np.max(logits))
                 max_softmax = float(np.max(softmax(logits)))
                 
-                features.append([ent, max_logit, max_softmax])
+                features.extend([ent, max_logit, max_softmax])
                 
                 # normalized token position:
                 features.append(token_pos / max_position)
@@ -232,7 +237,7 @@ def compute_adaptive_fp_replication_factors(y_all, pos_all, win=5):
         n_0 = np.sum(np.array(local_labels) == 0)
         n_1 = np.sum(np.array(local_labels) == 1)
         if n_0 == 0:
-            replication_factors[j] = 10
+            replication_factors[j] = 20
         else:
             replication_factors[j] = max(int(fp2tp_ratio * np.round(n_1 / n_0)), 1)
 
@@ -247,6 +252,7 @@ def balance_fp_samples_adaptive(X, y, pos, cls, fp_factors):
     for p, factor in fp_factors.items():
         mask = (y == 0) & (pos == p)
         if np.any(mask) and factor > 1:
+            factor = min(factor, 30)
             X_rep = np.repeat(X[mask], factor, axis=0)
             y_rep = np.repeat(y[mask], factor, axis=0)
             pos_rep = np.repeat(pos[mask], factor, axis=0)
@@ -309,6 +315,8 @@ intersect_ids = list(set(attn_files_dict).intersection(set(score_files_dict)))
 
 n_files = len(intersect_ids)
 
+print(f"Found {n_files} files")
+
 
 if dataset_path and os.path.exists(f"{dataset_path}/x.npy"):
 # if False:
@@ -333,6 +341,13 @@ else:
         
 
 
+if not use_attns:
+    X_all = X_all[:, -4:]    
+elif not use_logits:
+    X_all = np.concatenate([X_all[:, :-4], X_all[:, -1:]], -1)
+elif not use_attns and not use_logits:
+    X_all = X_all[:, -1:]
+    
 if pos_condition:
     X_all = X_all[:, :-1]
 
@@ -391,11 +406,32 @@ print(f"Test size:  {len(y_test)} | TP={np.sum(y_test==1)}, FP={np.sum(y_test==0
 # Build position-dependent priors
 # -----------------------------
 
+def fill_nans_linear(x):
+    x = x.astype(float)
+    n = len(x)
+    idx = np.arange(n)
+
+    valid = ~np.isnan(x)
+    if valid.sum() == 0:
+        return x  
+
+    x_filled = x.copy()
+    x_filled[~valid] = np.interp(
+        idx[~valid],
+        idx[valid],
+        x[valid]
+    )
+    return x_filled
+
+
 positions = np.arange(min_position, max_position + 1)
 
 fp_factors = np.array([
     train_fp_factors.get(p, np.nan) for p in positions
 ], dtype=float)
+
+fp_factors = fill_nans_linear(fp_factors)
+
 
 kernel = np.array([0.1, 0.2, 0.4, 0.2, 0.1])
 fp_factors_smoothed = fp_factors.copy()
@@ -407,6 +443,9 @@ p_tp = fp_factors_smoothed / (1.0 + fp_factors_smoothed)
 eps = 1e-7
 p_fp = np.clip(p_fp, eps, 1 - eps)
 p_tp = np.clip(p_tp, eps, 1 - eps)
+
+p_tp = fill_nans_linear(p_tp)
+p_fp = fill_nans_linear(p_fp)
 
 priors = np.stack([p_fp, p_tp], axis=1)
 priors_t = torch.tensor(priors, dtype=torch.float32).to(device)
@@ -631,6 +670,13 @@ with torch.no_grad():
 y_probs = np.array(y_probs)
 y_pred  = np.array(y_pred)
 y_true  = np.array(y_true)
+
+
+np.save(f"{results_dir}/y_probs_{target_rep}.npy", y_probs)
+np.save(f"{results_dir}/y_pred_{target_rep}.npy", y_pred)
+np.save(f"{results_dir}/y_true_{target_rep}.npy", y_true)
+np.save(f"{results_dir}/cls_test_{target_rep}.npy", cls_test)
+np.save(f"{results_dir}/pos_test_{target_rep}.npy", pos_test)
 
 
 
