@@ -348,7 +348,7 @@ elif not use_logits:
 elif not use_attns and not use_logits:
     X_all = X_all[:, -1:]
     
-if pos_condition:
+if not pos_condition:
     X_all = X_all[:, :-1]
 
 if other_dropout > 0:
@@ -447,7 +447,7 @@ p_tp = np.clip(p_tp, eps, 1 - eps)
 p_tp = fill_nans_linear(p_tp)
 p_fp = fill_nans_linear(p_fp)
 
-priors = np.stack([p_fp, p_tp], axis=1)
+priors = np.stack([p_fp, p_tp], axis=1) # shape: (151, 2)
 priors_t = torch.tensor(priors, dtype=torch.float32).to(device)
 
 
