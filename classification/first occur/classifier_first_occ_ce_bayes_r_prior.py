@@ -37,10 +37,16 @@ attn_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/Ensemble/expe
 score_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/Ensemble/experiments/new_per_sample_outputs/scores_greedy_rep_aware_double"
 priors_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/final_cl_results/priors"
 base_save_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/final_cl_results"
+
+attn_dir = "../../data/all layers all attention tp fp rep double r"
+score_dir = "../../data/double_scores r"
+priors_dir = 'prior_dir_test'
+base_save_dir = "final_cl_results_r"
+
 os.makedirs(base_save_dir, exist_ok=True)
 os.makedirs(priors_dir, exist_ok=True)
-dataset_path = f"{base_save_dir}/cls_data_{target_rep}"
-# n_files = 3900
+dataset_path = f"{base_save_dir}/cls_data_r_{target_rep}"
+
 
 if target_class == 'tp':
     other_dropout = 1
@@ -158,7 +164,7 @@ def extract_attention_score_values(attn_dict, score_dict, cls_, source="image"):
 
 
 def extract_all_features(attn_file_dict, score_file_dict, file_ids, n_layers, n_heads, min_position, max_position):
-    X, y, pos_list, cls_list, lemma_list, all_occ_ind_list = [], [], [], [], [], []
+    X, y, pos_list, cls_list, lemma_list, all_occ_ind_list, rep_list = [], [], [], [], [], [], []
 
     for j in tqdm(range(len(file_ids)), desc="Extracting features"):
         file_id = file_ids[j]
@@ -189,7 +195,7 @@ def extract_all_features(attn_file_dict, score_file_dict, file_ids, n_layers, n_
                 if token_pos < min_position or token_pos > max_position:
                     continue
 
-
+                rep_list.append(total_reps)
                 n_repeat = min(total_reps-1, 3)
 
                 features = []
@@ -227,8 +233,11 @@ def extract_all_features(attn_file_dict, score_file_dict, file_ids, n_layers, n_
                 lemma_list.append(lemma)
                 all_occ_ind_list.append(all_occ_indices)
     if len(X) == 0:
-        return None, None, None, None, None
-    return np.array(X), np.array(y), np.array(pos_list), np.array(cls_list), np.array(lemma_list, dtype=object), np.array(all_occ_ind_list, dtype=object)
+        return None, None, None, None, None, None, None
+    
+    rep_list = np.clip(rep_list, 1, 4) # hard-coded values for now
+    
+    return np.array(X), np.array(y), np.array(pos_list), np.array(cls_list), np.array(lemma_list, dtype=object), np.array(all_occ_ind_list, dtype=object), rep_list
 
 
 def compute_adaptive_fp_replication_factors(y_all, pos_all, win=5):
@@ -261,9 +270,9 @@ def compute_adaptive_fp_replication_factors(y_all, pos_all, win=5):
     return replication_factors
 
 
-def balance_fp_samples_adaptive(X, y, pos, cls, lmm, occ, fp_factors):
+def balance_fp_samples_adaptive(X, y, pos, cls, lmm, occ, reps, fp_factors):
     """Replicate FP samples based on adaptive per-position factors."""
-    X_bal, y_bal, pos_bal, cls_bal, lmm_bal, occ_bal = [X], [y], [pos], [cls], [lmm], [occ]
+    X_bal, y_bal, pos_bal, cls_bal, lmm_bal, occ_bal, reps_bal = [X], [y], [pos], [cls], [lmm], [occ], [reps]
 
     for p, factor in fp_factors.items():
         mask = (y == 0) & (pos == p)
@@ -275,12 +284,14 @@ def balance_fp_samples_adaptive(X, y, pos, cls, lmm, occ, fp_factors):
             cls_rep = np.repeat(cls[mask], factor, axis=0)
             lmm_rep = np.repeat(lmm[mask], factor, axis=0)
             occ_rep = np.repeat(occ[mask], factor, axis=0)
+            reps_rep = np.repeat(reps[mask], factor, axis=0)
             X_bal.append(X_rep)
             y_bal.append(y_rep)
             pos_bal.append(pos_rep)
             cls_bal.append(cls_rep)
             lmm_bal.append(lmm_rep)
             occ_bal.append(occ_rep)
+            reps_bal.append(reps_rep)
 
     X_bal = np.concatenate(X_bal, axis=0)
     y_bal = np.concatenate(y_bal, axis=0)
@@ -288,10 +299,11 @@ def balance_fp_samples_adaptive(X, y, pos, cls, lmm, occ, fp_factors):
     cls_bal = np.concatenate(cls_bal, axis=0)
     lmm_bal = np.concatenate(lmm_bal, axis=0)
     occ_bal = np.concatenate(occ_bal, axis=0)
+    reps_bal = np.concatenate(reps_bal, axis=0)
 
-    return X_bal, y_bal, pos_bal, cls_bal, lmm_bal, occ_bal
+    return X_bal, y_bal, pos_bal, cls_bal, lmm_bal, occ_bal, reps_bal
 
-def drop_samples(X, y, pos, cls, lmm, occ,target="other", dropout_ratio=0.5):
+def drop_samples(X, y, pos, cls, lmm, occ, reps,target="other", dropout_ratio=0.5):
     """
     Randomly remove a fraction of 'target' class samples from the dataset.
     """
@@ -299,7 +311,7 @@ def drop_samples(X, y, pos, cls, lmm, occ,target="other", dropout_ratio=0.5):
     target_indices = np.where(mask_target)[0]
 
     if dropout_ratio <= 0 or len(target_indices) == 0:
-        return X, y, pos, cls, lmm, occ
+        return X, y, pos, cls, lmm, occ, reps
     if dropout_ratio >= 1.0:
         keep_mask = ~mask_target
     else:
@@ -309,7 +321,7 @@ def drop_samples(X, y, pos, cls, lmm, occ,target="other", dropout_ratio=0.5):
         keep_mask[drop_indices] = False
 
     print(f"Dropped {np.sum(~keep_mask)} / {len(cls)} ('{target}' samples removed: {100*dropout_ratio:.1f}%)")
-    return X[keep_mask], y[keep_mask], pos[keep_mask], cls[keep_mask], lmm[keep_mask], occ[keep_mask]
+    return X[keep_mask], y[keep_mask], pos[keep_mask], cls[keep_mask], lmm[keep_mask], occ[keep_mask], reps[keep_mask]
 
 
 
@@ -333,7 +345,7 @@ for f in score_files:
 attn_ids = list(attn_files_dict.keys())
 score_ids = list(score_files_dict.keys())
 
-intersect_ids = list(set(attn_files_dict).intersection(set(score_files_dict)))
+intersect_ids = list(set(attn_ids).intersection(set(score_ids)))
 
 n_files = len(intersect_ids)
 
@@ -349,7 +361,7 @@ if False:
     cls_all = np.load(f"{dataset_path}/cls.npy")
     lemma_all = np.load(f"{dataset_path}/lemma.npy")
 else:
-    X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all = extract_all_features(
+    X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all, reps_all = extract_all_features(
         attn_files_dict, score_files_dict, intersect_ids, n_layers, n_heads, min_position, max_position
     )
 
@@ -362,6 +374,7 @@ else:
         np.save(os.path.join(dataset_path, "cls.npy"), cls_all)
         np.save(os.path.join(dataset_path, "lemma.npy"), lemma_all)
         np.save(os.path.join(dataset_path, "occ_indices.npy"), all_occ_list_all)
+        np.save(os.path.join(dataset_path, "repeats.npy"), reps_all)
         print(f"Dataset saved in '{dataset_path}/'")
         
 
@@ -371,6 +384,7 @@ if not use_attns:
 elif not use_logits:
     X_all = np.concatenate([X_all[:, :-4], X_all[:, -1:]], -1)
 elif not use_attns and not use_logits:
+    assert False
     X_all = X_all[:, -1:]
     
 # We had a bug here (in the prev version), a "not" is added now:
@@ -388,14 +402,17 @@ if not pos_condition:
 
 
 if other_dropout > 0:
-    X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all = drop_samples(
-        X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all, target="other", dropout_ratio=other_dropout
+    X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all, reps_all = drop_samples(
+        X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all, reps_all, target="other", dropout_ratio=other_dropout
     )
 
 if tp_dropout > 0:
-    X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all = drop_samples(
-        X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all, target="tp", dropout_ratio=other_dropout
+    X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all, reps_all = drop_samples(
+        X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all, reps_all, target="tp", dropout_ratio=other_dropout
     )
+    
+reps_org = reps_all.copy()
+
 # -----------------------------
 # Train/Test Split
 # -----------------------------
@@ -412,9 +429,10 @@ pos_train, pos_test = pos_all[:n_train], pos_all[-n_test:]
 cls_train, cls_test = cls_all[:n_train], cls_all[-n_test:]
 lemma_train, lemma_test = lemma_all[:n_train], lemma_all[-n_test:]
 all_occ_train, all_occ_test = all_occ_list_all[:n_train], all_occ_list_all[-n_test:]
+reps_train, reps_test = reps_all[:n_train], reps_all[-n_test:]
 
-X_train_original = X_train.copy()
-y_train_original = y_train.copy()
+X_train_original = X_all #X_train.copy()
+y_train_original = y_all #y_train.copy()
 
 # -----------------------------
 # Apply Adaptive FP Balancing
@@ -424,13 +442,13 @@ test_fp_factors = train_fp_factors #compute_adaptive_fp_replication_factors(y_te
 
 
 if balanced_train:
-    X_train, y_train, pos_train, cls_train, lemma_train, all_occ_train = balance_fp_samples_adaptive(
-        X_train, y_train, pos_train, cls_train, lemma_train, all_occ_train, train_fp_factors
+    X_train, y_train, pos_train, cls_train, lemma_train, all_occ_train, reps_train = balance_fp_samples_adaptive(
+        X_train, y_train, pos_train, cls_train, lemma_train, all_occ_train, reps_train, train_fp_factors
     )
 
 if balanced_test:
-    X_test, y_test, pos_test, cls_test, lemma_test, all_occ_test = balance_fp_samples_adaptive(
-        X_test, y_test, pos_test, cls_test, lemma_test, all_occ_test , test_fp_factors
+    X_test, y_test, pos_test, cls_test, lemma_test, all_occ_test, reps_test = balance_fp_samples_adaptive(
+        X_test, y_test, pos_test, cls_test, lemma_test, all_occ_test, reps_test , test_fp_factors
     )
 
 
@@ -494,8 +512,9 @@ np.save(
 )
 
 ######## repition prior ##########
-rep_vals = X_train_original[:, 0].astype(int)
+rep_vals = reps_org.astype(int) - 1
 labels   = y_train_original
+
 
 n_bins = 4
 eps = 1e-6
@@ -534,8 +553,6 @@ np.save(
 
 
 
-
-
 # -----------------------------
 # Torch Model
 # -----------------------------
@@ -543,7 +560,6 @@ X_train_t = torch.tensor(X_train, dtype=torch.float32)
 y_train_t = torch.tensor(y_train, dtype=torch.long)
 X_test_t = torch.tensor(X_test, dtype=torch.float32)
 y_test_t = torch.tensor(y_test, dtype=torch.long)
-
 
 
 if normalize_features:
@@ -560,7 +576,6 @@ pos_norm_max = float(X_train_t[:, -1].max().item())
 
 rep_norm_min = float(X_train_t[:, 0].min().item())
 rep_norm_max = float(X_train_t[:, 0].max().item())
-
 
 
 class BayesianMLPClassifier(nn.Module):
@@ -804,3 +819,29 @@ np.save(f"{results_dir}/pos_test_{target_rep}.npy", pos_test)
 np.save(f"{results_dir}/lemma_test_{target_rep}.npy", lemma_test)
 
 
+y_probs2 = []
+y_pred2 = []
+y_true2 = []
+cls_test2 = []
+pos_test2 = []
+lemma_test2 = []
+
+for i, r in enumerate(reps_test):
+    if r < 2:
+        continue
+    for k in range(r-1):
+        y_probs2.append(y_probs[i])
+        y_pred2.append(y_pred[i])
+        y_true2.append(y_true[i])
+        cls_test2.append(cls_test[i])
+        pos_test2.append(pos_test[i])
+        lemma_test2.append(lemma_test[i])
+        
+target_rep = 2
+np.save(f"{results_dir}/y_probs_{target_rep}.npy", y_probs2)
+np.save(f"{results_dir}/y_pred_{target_rep}.npy", y_pred2)
+np.save(f"{results_dir}/y_true_{target_rep}.npy", y_true2)
+np.save(f"{results_dir}/cls_test_{target_rep}.npy", cls_test2)
+np.save(f"{results_dir}/pos_test_{target_rep}.npy", pos_test2)
+np.save(f"{results_dir}/lemma_test_{target_rep}.npy", lemma_test2)        
+        
