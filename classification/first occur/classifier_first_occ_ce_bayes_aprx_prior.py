@@ -40,7 +40,6 @@ priors_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experi
 base_save_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/final_cl_results"
 
 
-
 os.makedirs(base_save_dir, exist_ok=True)
 os.makedirs(priors_dir, exist_ok=True)
 dataset_path = f"{base_save_dir}/cls_data_r_{target_rep}"
@@ -573,19 +572,42 @@ prior_net = PriorRTNet(hidden=32).to(device)
 prior_optimizer = torch.optim.Adam(
     prior_net.parameters(), lr=1e-3, weight_decay=1e-4
 )
-prior_criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+prior_criterion = nn.CrossEntropyLoss(label_smoothing=0.02)
+
+
+
+prior_dataset = TensorDataset(X_prior_t, y_prior_t)
+prior_loader = DataLoader(
+    prior_dataset,
+    batch_size=160,
+    shuffle=True,
+    drop_last=False
+)
 
 prior_net.train()
-for epoch in range(7):
-    logits = prior_net(X_prior_t)
-    loss = prior_criterion(logits, y_prior_t)
 
-    prior_optimizer.zero_grad()
-    loss.backward()
-    prior_optimizer.step()
+for epoch in range(7): # hard code for now
+    epoch_loss = 0.0
+    n_samples = 0
+
+    for xb, yb in prior_loader:
+        logits = prior_net(xb)
+        loss = prior_criterion(logits, yb)
+
+        prior_optimizer.zero_grad()
+        loss.backward()
+        prior_optimizer.step()
+
+        epoch_loss += loss.item() * xb.size(0)
+        n_samples += xb.size(0)
+
+    epoch_loss /= n_samples
 
     if (epoch + 1) % 2 == 0:
-        print(f"[Prior] Epoch {epoch+1:02d} | Loss: {loss.item():.4f}")
+        print(
+            f"[Prior] Epoch {epoch+1:02d} | "
+            f"Avg Loss: {epoch_loss:.4f}"
+        )
 
 
 prior_net.eval()
