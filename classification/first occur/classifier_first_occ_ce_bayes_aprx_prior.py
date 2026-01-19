@@ -40,6 +40,7 @@ priors_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experi
 base_save_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/final_cl_results"
 
 
+
 os.makedirs(base_save_dir, exist_ok=True)
 os.makedirs(priors_dir, exist_ok=True)
 dataset_path = f"{base_save_dir}/cls_data_r_{target_rep}"
@@ -575,15 +576,15 @@ prior_optimizer = torch.optim.Adam(
 prior_criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
 
 prior_net.train()
-for epoch in range(4):
-    logits = prior_net()
+for epoch in range(7):
+    logits = prior_net(X_prior_t)
     loss = prior_criterion(logits, y_prior_t)
 
     prior_optimizer.zero_grad()
     loss.backward()
     prior_optimizer.step()
 
-    if (epoch + 1) % 5 == 0:
+    if (epoch + 1) % 2 == 0:
         print(f"[Prior] Epoch {epoch+1:02d} | Loss: {loss.item():.4f}")
 
 
@@ -888,3 +889,185 @@ np.save(f"{results_dir}/cls_test_{target_rep}.npy", cls_test2)
 np.save(f"{results_dir}/pos_test_{target_rep}.npy", pos_test2)
 np.save(f"{results_dir}/lemma_test_{target_rep}.npy", lemma_test2)        
         
+
+
+
+
+
+
+# ============================================================
+# Evaluate and marginalize learned joint prior p(y | r, t)
+# ============================================================
+
+import matplotlib.pyplot as plt
+
+prior_net.eval()
+
+# Original (unbalanced) data
+rep_vals = (reps_org.astype(np.int64) - 1)     # 0..3
+pos_vals = pos_all.astype(np.int64)            # min_position..max_position
+
+# Normalize for prior network
+rep_norm = rep_vals / 3.0
+pos_norm = (pos_vals - min_position) / (max_position - min_position)
+
+X_rt = torch.tensor(
+    np.stack([rep_norm, pos_norm], axis=1),
+    dtype=torch.float32
+).to(device)
+
+with torch.no_grad():
+    prior_logits = prior_net(X_rt)
+    prior_probs = torch.softmax(prior_logits, dim=1).cpu().numpy()
+    
+
+# ============================================================
+# p(y | r)
+# ============================================================
+
+p_y_given_r = np.zeros((4, 2), dtype=np.float64)
+
+for r in range(4):
+    mask = rep_vals == r
+    assert mask.sum() > 0, f"No samples for repetition r={r}"
+    p_y_given_r[r] = prior_probs[mask].mean(axis=0)
+
+
+
+# ============================================================
+# p(y | t)
+# ============================================================
+
+positions = np.arange(min_position, max_position + 1)
+p_y_given_t = np.zeros((len(positions), 2), dtype=np.float64)
+
+for i, t in enumerate(positions):
+    mask = pos_vals == t
+    # assert mask.sum() > 0, f"No samples for position t={t}"
+    if mask.sum() < 1:
+        continue
+    p_y_given_t[i] = prior_probs[mask].mean(axis=0)
+
+
+
+
+
+priors_r_tab = priors_r.cpu().numpy()          # shape (4, 2)
+priors_t_tab = priors_t.cpu().numpy()            # shape (151, 2)
+
+
+
+
+# ============================================================
+# Plot p(y | r) for both classes
+# ============================================================
+
+p_y_given_r = p_y_given_r / p_y_given_r.sum(0)
+
+r_vals = np.arange(1, 5)
+width = 0.35
+
+for y in [0, 1]:
+    plt.figure(figsize=(6, 4))
+
+    plt.bar(
+        r_vals - width / 2,
+        priors_r_tab[:, y],
+        width=width,
+        label=f"Tabular (y={y})",
+        alpha=0.8
+    )
+    plt.bar(
+        r_vals + width / 2,
+        p_y_given_r[:, y],
+        width=width,
+        label=f"Learned (y={y})",
+        alpha=0.8
+    )
+
+    plt.xlabel("Repetition (r)")
+    plt.ylabel(f"p(y={y} | r)")
+    plt.title(f"Repetition prior comparison (class {y})")
+    plt.legend()
+    plt.tight_layout()
+
+    save_path = os.path.join(priors_dir, f"prior_r_class_{y}.png")
+    plt.savefig(save_path)
+    plt.close()
+
+
+
+# ============================================================
+# Plot p(y | t) for both classes
+# ============================================================
+
+for y in [0, 1]:
+    plt.figure(figsize=(10, 4))
+
+    plt.plot(
+        positions,
+        priors_t_tab[:, y],
+        label=f"Tabular (y={y})",
+        linewidth=2
+    )
+    plt.plot(
+        positions,
+        p_y_given_t[:, y],
+        label=f"Learned (y={y})",
+        linewidth=2,
+        linestyle="--"
+    )
+
+    plt.xlabel("Token position (t)")
+    plt.ylabel(f"p(y={y} | t)")
+    plt.title(f"Token-position prior comparison (class {y})")
+    plt.legend()
+    plt.tight_layout()
+
+    save_path = os.path.join(priors_dir, f"prior_t_class_{y}.png")
+    plt.savefig(save_path)
+    plt.close()
+
+
+
+
+
+# ============================================================
+# Difference plots (Learned − Tabular)
+# ============================================================
+
+# Repetition
+for y in [0, 1]:
+    plt.figure(figsize=(6, 3))
+    plt.bar(
+        r_vals,
+        p_y_given_r[:, y] - priors_r_tab[:, y]
+    )
+    plt.axhline(0, color="black", linewidth=1)
+    plt.xlabel("Repetition (r)")
+    plt.ylabel(f"Δ p(y={y} | r)")
+    plt.title(f"Difference in repetition prior (class {y})")
+    plt.tight_layout()
+
+    save_path = os.path.join(priors_dir, f"diff_prior_r_class_{y}.png")
+    plt.savefig(save_path)
+    plt.close()
+
+# Position
+for y in [0, 1]:
+    plt.figure(figsize=(10, 3))
+    plt.plot(
+        positions,
+        p_y_given_t[:, y] - priors_t_tab[:, y]
+    )
+    plt.axhline(0, color="black", linewidth=1)
+    plt.xlabel("Token position (t)")
+    plt.ylabel(f"Δ p(y={y} | t)")
+    plt.title(f"Difference in token-position prior (class {y})")
+    plt.tight_layout()
+
+    save_path = os.path.join(priors_dir, f"diff_prior_t_class_{y}.png")
+    plt.savefig(save_path)
+    plt.close()
+
+
