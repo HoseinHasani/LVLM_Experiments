@@ -40,6 +40,7 @@ priors_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experi
 base_save_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/final_cl_results"
 
 
+
 os.makedirs(base_save_dir, exist_ok=True)
 os.makedirs(priors_dir, exist_ok=True)
 dataset_path = f"{base_save_dir}/cls_data_r_{target_rep}"
@@ -471,34 +472,58 @@ def fill_nans_linear(x):
 
 positions = np.arange(min_position, max_position + 1)
 
-fp_factors = np.array([
-    train_fp_factors.get(p, np.nan) for p in positions
-], dtype=float)
+# -----------------------------
+# Empirical position priors p(y | t) from original dataset
+# -----------------------------
 
-fp_factors = fill_nans_linear(fp_factors)
+# Use ORIGINAL (unbalanced) data
+pos_orig = pos_all          # token positions
+labels_orig = y_all         # 0 = FP, 1 = TP
 
+positions = np.arange(min_position, max_position + 1)
+n_pos = len(positions)
 
-kernel = np.array([0.1, 0.2, 0.4, 0.2, 0.1])
-fp_factors_smoothed = fp_factors.copy()
-fp_factors_smoothed[-2:2] = np.convolve(fp_factors, kernel, mode="same")[-2:2]
+# counts[t, y]
+counts = np.zeros((n_pos, 2), dtype=np.float32)
 
-p_fp = 1.0 / (1.0 + fp_factors_smoothed)
-p_tp = fp_factors_smoothed / (1.0 + fp_factors_smoothed)
+for i, t in enumerate(positions):
+    mask = (pos_orig == t)
+    if mask.any():
+        counts[i, 0] = np.sum(labels_orig[mask] == 0)
+        counts[i, 1] = np.sum(labels_orig[mask] == 1)
+    else:
+        counts[i, :] = np.nan
 
+# Convert counts → priors
+priors_tokenposition = np.full((n_pos, 2), np.nan, dtype=np.float32)
+
+total = counts.sum(axis=1)
+
+valid = total > 0
+priors_tokenposition[valid, 0] = counts[valid, 0] / total[valid]
+priors_tokenposition[valid, 1] = counts[valid, 1] / total[valid]
+
+# Fill missing positions using nearest non-NaN
+priors_tokenposition[:, 0] = fill_nans_linear(priors_tokenposition[:, 0])
+priors_tokenposition[:, 1] = fill_nans_linear(priors_tokenposition[:, 1])
+
+# Numerical safety
 eps = 1e-7
-p_fp = np.clip(p_fp, eps, 1 - eps)
-p_tp = np.clip(p_tp, eps, 1 - eps)
+priors_tokenposition = np.clip(priors_tokenposition, eps, 1 - eps)
+priors_tokenposition /= priors_tokenposition.sum(axis=1, keepdims=True)
 
-p_tp = fill_nans_linear(p_tp)
-p_fp = fill_nans_linear(p_fp)
+# Torch tensor
+priors_t = torch.tensor(
+    priors_tokenposition,
+    dtype=torch.float32
+).to(device)
 
-priors_tokenposition = np.stack([p_fp, p_tp], axis=1) # shape: (151, 2)
-priors_t = torch.tensor(priors_tokenposition, dtype=torch.float32).to(device)
-
+# Save
 np.save(
     os.path.join(priors_dir, "priors_token_position.npy"),
     priors_tokenposition
 )
+
 
 ######## repition prior ##########
 rep_vals = reps_org.astype(int) - 1
@@ -575,7 +600,6 @@ prior_optimizer = torch.optim.Adam(
 prior_criterion = nn.CrossEntropyLoss(label_smoothing=0.02)
 
 
-
 prior_dataset = TensorDataset(X_prior_t, y_prior_t)
 prior_loader = DataLoader(
     prior_dataset,
@@ -616,7 +640,6 @@ for p in prior_net.parameters():
 
 torch.save(prior_net.state_dict(), os.path.join(priors_dir, "prior_rt_mlp.pt"))
 print("Joint prior network trained and saved.")
-
 
 
 
