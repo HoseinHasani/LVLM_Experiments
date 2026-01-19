@@ -344,35 +344,78 @@ class BayesianInference:
     
 
 
-def load_real_attention_samples(data_dir, n_samples=100, n_layers=32, n_heads=32, n_top_k=20):
+def load_real_attention_samples(
+    data_dir,
+    n_samples=100,
+    n_layers=32,
+    n_heads=32,
+    n_top_k=20,
+):
     files = sorted(glob(os.path.join(data_dir, "attentions_*.pkl")))
     samples = []
 
     for fpath in files[:n_samples]:
         try:
-            with open(fpath, "rb") as handle:
-                data = pickle.load(handle)
+            with open(fpath, "rb") as f:
+                attn_data = pickle.load(f)
         except Exception as e:
             print(f"Skipping {fpath}: {e}")
             continue
 
-        for cls_name, label in [("fp", 1), ("tp", 0), ("other", 0)]:
-            entries = data.get(cls_name, {}).get("image", [])
-            for e in entries:
+        score_path = fpath.replace("attentions_", "scores_").replace(data_dir, "scores")
+        if not os.path.exists(score_path):
+            continue
+
+        try:
+            with open(score_path, "rb") as f:
+                score_data = pickle.load(f)
+        except Exception:
+            continue
+
+        for cls_name, label in [("fp", 0), ("tp", 1), ("other", 1)]:
+            attn_entries = attn_data.get(cls_name, {}).get("image", [])
+            score_entries = score_data.get(cls_name, [])
+
+            for k in range(min(len(attn_entries), len(score_entries))):
+                e = attn_entries[k]
+                meta = attn_data.get(cls_name, {}).get("meta", [])[k]
+
                 if not e.get("subtoken_results"):
                     continue
-                for sub in e["subtoken_results"][:1]:
-                    topk_vals = np.array(sub.get("topk_values"), dtype=float)
-                    if topk_vals.ndim != 3:
-                        continue
-                    idx = int(sub.get("idx", -1))
-                    if idx < 0:
-                        continue
 
-                    topk_vals = topk_vals[..., :n_top_k]
-                    attn_dict = {idx: topk_vals}
-                    samples.append((attn_dict, label))
+                sub = e["subtoken_results"][0]
+
+                idx = int(sub.get("idx", -1))
+                if idx < 0:
+                    continue
+
+                topk_vals = np.array(sub.get("topk_values"), dtype=float)
+                topk_vals_next = np.array(sub.get("topk_values_next"), dtype=float)
+
+                if topk_vals.ndim != 3 or topk_vals_next.ndim != 3:
+                    continue
+
+                topk_vals = topk_vals[..., :n_top_k]
+                topk_vals_next = topk_vals_next[..., :n_top_k]
+
+                logits = np.array(score_entries[k][1], dtype=float)
+                total_reps = meta.get("total_reps", 1)
+
+                samples.append(
+                    (
+                        {
+                            "token_idx": idx,
+                            "topk_attn": topk_vals,
+                            "topk_attn_next": topk_vals_next,
+                            "logits": logits,
+                            "total_reps": total_reps,
+                        },
+                        label,
+                    )
+                )
+
     return samples
+
 
 
 
@@ -391,40 +434,60 @@ def plot_confusion_matrix(y_true, y_pred, classes, normalize=False, title='Confu
 
 
 def evaluate_on_real_data(classifier, data_dir, n_eval=100):
-    samples = load_real_attention_samples(data_dir, n_samples=n_eval,
-                                          n_layers=classifier.n_layers,
-                                          n_heads=classifier.n_heads)
+    samples = load_real_attention_samples(
+        data_dir,
+        n_samples=n_eval,
+        n_layers=classifier.n_layers,
+        n_heads=classifier.n_heads,
+        n_top_k=classifier.n_top_k,
+    )
 
     y_true, y_pred = [], []
 
-    for attn_dict, label in tqdm(samples):
-        preds = classifier.predict(attn_dict)
+    for sample, label in tqdm(samples, desc="Evaluating"):
+        preds = classifier.predict([sample])
         if not preds:
             continue
-        prob = list(preds.values())[0]
+
+        token_idx = sample["token_idx"]
+        bayes_prob = preds[token_idx]["bayes_tp_prob"]
+
         y_true.append(label)
-        y_pred.append(prob)
+        y_pred.append(bayes_prob)
 
     if not y_true:
         print("No valid samples found for evaluation.")
         return
 
-    print(np.max(y_pred), np.min(y_pred), np.mean(y_pred), np.std(y_pred))
+    y_pred = np.array(y_pred)
+    y_bin = (y_pred > 0.5).astype(int)
 
-    y_bin = (np.array(y_pred) > 0.5).astype(int)
+    print(
+        "Bayes prob stats:",
+        np.max(y_pred),
+        np.min(y_pred),
+        np.mean(y_pred),
+        np.std(y_pred),
+    )
+
     acc = accuracy_score(y_true, y_bin)
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true, y_bin, average="binary"
     )
 
-    print(f"\n=== Evaluation on {n_eval} Data ===")
-    print(f"Samples:   {len(y_true)}")
+    print(f"\n=== Bayesian Evaluation on {len(y_true)} Samples ===")
     print(f"Accuracy:  {acc:.3f}")
     print(f"Precision: {precision:.3f}")
     print(f"Recall:    {recall:.3f}")
     print(f"F1-score:  {f1:.3f}")
 
-    plot_confusion_matrix(y_true, y_bin, classes=['Not Target', 'Target'], normalize=False)
+    plot_confusion_matrix(
+        y_true,
+        y_bin,
+        classes=["FP", "TP"],
+        normalize=False,
+        title="Bayesian Confusion Matrix",
+    )
 
     return {
         "accuracy": acc,
@@ -432,6 +495,7 @@ def evaluate_on_real_data(classifier, data_dir, n_eval=100):
         "recall": recall,
         "f1": f1,
     }
+
 
 
     
