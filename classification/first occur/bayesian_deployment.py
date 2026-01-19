@@ -11,21 +11,170 @@ from sklearn.metrics import confusion_matrix
 import seaborn as sns
 
 
-class MLPClassifierTorch(nn.Module):
-    def __init__(self, input_dim, hidden1=512, hidden2=64, dropout_rate=0.5):
+class PriorRTNet(nn.Module):
+    def __init__(self, hidden=32):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Dropout(dropout_rate),
-            nn.Linear(input_dim, hidden1),
+            nn.Linear(2, hidden),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden1, hidden2),
-            nn.ReLU(),
-            nn.Linear(hidden2, 1)
+            nn.Linear(hidden, 2)
         )
 
     def forward(self, x):
-        return self.net(x).squeeze(1)
+        return self.net(x)
+
+
+class BayesianMLPClassifier(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        prior_net,
+        pos_norm_min,
+        pos_norm_max,
+        rep_norm_min,
+        rep_norm_max,
+        min_position,
+        max_position,
+        hidden1=512,
+        hidden2=64,
+        dropout_rate=0.5,
+    ):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(input_dim, hidden1), nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden1, hidden2), nn.ReLU(),
+            nn.Linear(hidden2, 2)
+        )
+
+        self.prior_net = prior_net
+
+        self.pos_norm_min = pos_norm_min
+        self.pos_norm_max = pos_norm_max
+        self.rep_norm_min = rep_norm_min
+        self.rep_norm_max = rep_norm_max
+
+        self.min_position = min_position
+        self.max_position = max_position
+
+        self.min_repetition = 0
+        self.max_repetition = 3
+
+    def decode_positions(self, x):
+        pos_norm = x[:, -1]
+        pos_real = (
+            (pos_norm - self.pos_norm_min)
+            / (self.pos_norm_max - self.pos_norm_min)
+        ) * (self.max_position - self.min_position) + self.min_position
+        return torch.clamp(torch.round(pos_real), self.min_position, self.max_position).long()
+
+    def decode_repetitions(self, x):
+        rep_norm = x[:, 0]
+        rep_real = (
+            (rep_norm - self.rep_norm_min)
+            / (self.rep_norm_max - self.rep_norm_min)
+        ) * (self.max_repetition - self.min_repetition)
+        return torch.clamp(torch.round(rep_real), self.min_repetition, self.max_repetition).long()
+
+    def forward(self, x):
+        raw_logits = self.net(x)
+        raw_post = torch.softmax(raw_logits, dim=1)
+
+        pos_real = self.decode_positions(x)
+        rep_real = self.decode_repetitions(x)
+
+        pos_norm = (pos_real - self.min_position) / (self.max_position - self.min_position)
+        rep_norm = rep_real / self.max_repetition
+
+        rt = torch.stack([rep_norm, pos_norm], dim=1)
+
+        prior_logits = self.prior_net(rt)
+        priors = torch.softmax(prior_logits, dim=1)
+
+        bayes_unnorm = raw_post * priors
+        bayes_post = bayes_unnorm / (bayes_unnorm.sum(dim=1, keepdim=True) + 1e-8)
+        bayes_pred = torch.argmax(bayes_post, dim=1)
+
+        return raw_post, bayes_post, bayes_pred
+
+
+class BayesianMLPClassifier(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        prior_net,
+        pos_norm_min,
+        pos_norm_max,
+        rep_norm_min,
+        rep_norm_max,
+        min_position,
+        max_position,
+        hidden1=512,
+        hidden2=64,
+        dropout_rate=0.5,
+    ):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(input_dim, hidden1), nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden1, hidden2), nn.ReLU(),
+            nn.Linear(hidden2, 2)
+        )
+
+        self.prior_net = prior_net
+
+        self.pos_norm_min = pos_norm_min
+        self.pos_norm_max = pos_norm_max
+        self.rep_norm_min = rep_norm_min
+        self.rep_norm_max = rep_norm_max
+
+        self.min_position = min_position
+        self.max_position = max_position
+
+        self.min_repetition = 0
+        self.max_repetition = 3
+
+    def decode_positions(self, x):
+        pos_norm = x[:, -1]
+        pos_real = (
+            (pos_norm - self.pos_norm_min)
+            / (self.pos_norm_max - self.pos_norm_min)
+        ) * (self.max_position - self.min_position) + self.min_position
+        return torch.clamp(torch.round(pos_real), self.min_position, self.max_position).long()
+
+    def decode_repetitions(self, x):
+        rep_norm = x[:, 0]
+        rep_real = (
+            (rep_norm - self.rep_norm_min)
+            / (self.rep_norm_max - self.rep_norm_min)
+        ) * (self.max_repetition - self.min_repetition)
+        return torch.clamp(torch.round(rep_real), self.min_repetition, self.max_repetition).long()
+
+    def forward(self, x):
+        raw_logits = self.net(x)
+        raw_post = torch.softmax(raw_logits, dim=1)
+
+        pos_real = self.decode_positions(x)
+        rep_real = self.decode_repetitions(x)
+
+        pos_norm = (pos_real - self.min_position) / (self.max_position - self.min_position)
+        rep_norm = rep_real / self.max_repetition
+
+        rt = torch.stack([rep_norm, pos_norm], dim=1)
+
+        prior_logits = self.prior_net(rt)
+        priors = torch.softmax(prior_logits, dim=1)
+
+        bayes_unnorm = raw_post * priors
+        bayes_post = bayes_unnorm / (bayes_unnorm.sum(dim=1, keepdim=True) + 1e-8)
+        bayes_pred = torch.argmax(bayes_post, dim=1)
+
+        return raw_post, bayes_post, bayes_pred
+
 
 
 class FPAttentionClassifier:
