@@ -19,6 +19,7 @@ from collections import defaultdict
 
 
 #######################
+load_from_existing = False
 target_rep = 1
 
 target_class = 'tp'
@@ -38,10 +39,6 @@ score_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/Ensemble/exp
 priors_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/final_cl_results/priors"
 base_save_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/final_cl_results"
 
-attn_dir = "../../data/all layers all attention tp fp rep double r"
-score_dir = "../../data/double_scores r"
-priors_dir = 'prior_dir_test'
-base_save_dir = "final_cl_results_r"
 
 os.makedirs(base_save_dir, exist_ok=True)
 os.makedirs(priors_dir, exist_ok=True)
@@ -328,8 +325,8 @@ def drop_samples(X, y, pos, cls, lmm, occ, reps,target="other", dropout_ratio=0.
 # -----------------------------
 # Load or Extract Dataset
 # -----------------------------
-attn_files = sorted(glob(os.path.join(attn_dir, "attentions_*.pkl")))[:10]
-score_files = sorted(glob(os.path.join(score_dir, "scores_*.pkl")))[:10]
+attn_files = sorted(glob(os.path.join(attn_dir, "attentions_*.pkl")))
+score_files = sorted(glob(os.path.join(score_dir, "scores_*.pkl")))
 
 attn_files_dict = {}
 for f in attn_files:
@@ -352,8 +349,7 @@ n_files = len(intersect_ids)
 print(f"Found {n_files} files")
 
 
-# if dataset_path and os.path.exists(f"{dataset_path}/x.npy"):
-if False:
+if dataset_path and os.path.exists(f"{dataset_path}/x.npy") and load_from_existing:
     print("Loading saved dataset...")
     X_all = np.load(f"{dataset_path}/x.npy")
     y_all = np.load(f"{dataset_path}/y.npy")
@@ -366,7 +362,7 @@ else:
     )
 
     if X_all is not None:
-        dataset_path = f"{base_save_dir}/cls_data_{target_rep}"
+        # dataset_path = f"{base_save_dir}/cls_data_{target_rep}"
         os.makedirs(dataset_path, exist_ok=True)
         np.save(os.path.join(dataset_path, "x.npy"), X_all)
         np.save(os.path.join(dataset_path, "y.npy"), y_all)
@@ -387,18 +383,11 @@ elif not use_attns and not use_logits:
     assert False
     X_all = X_all[:, -1:]
     
-# We had a bug here (in the prev version), a "not" is added now:
 if not pos_condition:
     assert pos_condition
     X_all = X_all[:, :-1]
     
     
-# You must add the n_repeat to each feature vector,
-# Here I append a rand_int vector to the begging of x_train (and use the end of it for position)
-# you must replace this part by real values:
-# n_repeat_vec = np.random.randint(0, 4, size=(X_all.shape[0], 1)) 
-# Note that I clip values gearter than 4 to 4.
-# X_all = np.concatenate((n_repeat_vec, X_all), axis=1)
 
 
 if other_dropout > 0:
@@ -529,7 +518,7 @@ for r in range(n_bins):
 # add smoothing
 counts += eps
 
-# COLUMN-WISE normalization  (this is the key fix)
+# COLUMN-WISE normalization
 priors_r = counts / counts.sum(axis=0, keepdims=True)
 
 priors_r = torch.tensor(priors_r, dtype=torch.float32).to(device)
@@ -539,17 +528,6 @@ np.save(
     os.path.join(priors_dir, "priors_repetition.npy"),
     priors_r.cpu().numpy()
 )
-# priors_repeatition = np.array([[0.5, 0.5], [0.22, 0.78], [0.07, 0.93], [0.01, 0.99]]) # shape: (4, 2)
-# priors_r = torch.tensor(priors_repeatition, dtype=torch.float32).to(device)
-# I fill the values by my intuition. You should calculate this values statistically from your new dataset.
-# Here I just assume the prior distribution for the first occurance (target_rep = 1)
-# Here I assume that repeatition prior and token posistion priors are independent.
-# We can also lear a joint prior (joint of token position and repeatition), but leave this to future
-
-# Note that your current meta-data of repeatition is not the same as the previous one,
-# the previous one is the occurance of that token, hence it's always 1 for the first occurance
-# but in your new dataset, the n_repeat of the first occurance could be greater than one
-# here we just focus on the first occurance (target_rep = 1)
 
 
 
@@ -613,8 +591,8 @@ class BayesianMLPClassifier(nn.Module):
         
         self.rep_norm_min = rep_norm_min
         self.rep_norm_max = rep_norm_max
-        self.min_repeatition = 0 # meaning 1
-        self.max_repeatition = 3 # meaning 4
+        self.min_repetition = 0 # meaning 1
+        self.max_repetition = 3 # meaning 4
         
 
     def decode_positions(self, x):
@@ -632,18 +610,17 @@ class BayesianMLPClassifier(nn.Module):
 
         return pos_real
     
-    # I added this function to decode repeatition values back, after redundant normalization!
-    def decode_repeatitions(self, x):
+    def decode_repetitions(self, x):
         rep_norm = x[:, 0]
 
         rep_real = (
             (rep_norm - self.rep_norm_min)
             / (self.rep_norm_max - self.rep_norm_min)
-        ) * (self.max_repeatition - self.min_repeatition) + self.min_repeatition
+        ) * (self.max_repetition - self.min_repetition) + self.min_repetition
 
         rep_real = torch.round(rep_real).long()
         rep_real = torch.clamp(
-            rep_real, self.min_repeatition, self.max_repeatition
+            rep_real, self.min_repetition, self.max_repetition
         )
 
         return rep_real
@@ -671,13 +648,12 @@ class BayesianMLPClassifier(nn.Module):
         priors_tok_pos = self.priors_t[pos_idx]  # [B, 2]
         
         
-        # Decode token repeatition:
-        rep_real = self.decode_repeatitions(x)
-        rep_idx = rep_real - self.min_repeatition
+        # Decode token repetition:
+        rep_real = self.decode_repetitions(x)
+        rep_idx = rep_real - self.min_repetition
         # Fetch repeation priors for each sample
         priors_rep = self.priors_r[rep_idx]  # [B, 2]
         
-        # We can multiply prior probs; since we consider indipendence
         # Bayesian correction (probability space)
         bayes_unnormalized = raw_posteriors * priors_tok_pos * priors_rep
         bayes_posteriors = bayes_unnormalized / (
