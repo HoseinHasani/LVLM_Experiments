@@ -205,14 +205,14 @@ class BayesianInference:
         self.use_logits = use_logits
         self.use_entropy = use_entropy
 
-        scaler = torch.load(scaler_path, map_location=self.device)
+        scaler = torch.load(scaler_path, map_location=self.device, weights_only=True)
         self.mean = scaler["mean"].to(self.device)
         self.std = scaler["std"].to(self.device)
 
         self.input_dim = self.mean.numel()
 
         prior_net = PriorRTNet()
-        prior_net.load_state_dict(torch.load(prior_path, map_location=self.device))
+        prior_net.load_state_dict(torch.load(prior_path, map_location=self.device, weights_only=True))
         prior_net.eval()
         for p in prior_net.parameters():
             p.requires_grad = False
@@ -229,7 +229,7 @@ class BayesianInference:
             dropout_rate=dropout_rate,
         ).to(self.device)
 
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
         self.model.eval()
 
     # ---------- feature utils ----------
@@ -307,8 +307,7 @@ class BayesianInference:
 
         for s in samples:
             idx = s["token_idx"]
-            if idx < self.min_position or idx > self.max_position:
-                continue
+            idx = np.clip(idx, self.min_position, self.max_position)
 
             feats.append(
                 self.extract_features(
@@ -345,41 +344,65 @@ class BayesianInference:
 
 
 def load_real_attention_samples(
-    data_dir,
+    attn_dir,
+    score_dir,
     n_samples=100,
     n_layers=32,
     n_heads=32,
     n_top_k=20,
 ):
-    files = sorted(glob(os.path.join(data_dir, "attentions_*.pkl")))
+    attn_files = sorted(glob(os.path.join(attn_dir, "attentions_*.pkl")))
+    score_files = sorted(glob(os.path.join(score_dir, "scores_*.pkl")))
     samples = []
+    
+    attn_files_dict = {}
+    for f in attn_files:
+        key = int(os.path.splitext(os.path.basename(f))[0].split('_')[1])
+        attn_files_dict[key] = f
 
-    for fpath in files[:n_samples]:
+    score_files_dict = {}
+    for f in score_files:
+        key = int(os.path.splitext(os.path.basename(f))[0].split('_')[1])
+        score_files_dict[key] = f
+
+
+    attn_ids = list(attn_files_dict.keys())
+    score_ids = list(score_files_dict.keys())
+
+    intersect_ids = list(set(attn_ids).intersection(set(score_ids)))
+
+    for id_ in intersect_ids[:n_samples]:
+        attn_file_path = attn_files_dict[id_]
+        score_file_path = score_files_dict[id_]
+        
         try:
-            with open(fpath, "rb") as f:
+            with open(attn_file_path, "rb") as f:
                 attn_data = pickle.load(f)
         except Exception as e:
-            print(f"Skipping {fpath}: {e}")
+            print(f"Skipping {attn_file_path}: {e}")
             continue
 
-        score_path = fpath.replace("attentions_", "scores_").replace(data_dir, "scores")
-        if not os.path.exists(score_path):
-            continue
 
         try:
-            with open(score_path, "rb") as f:
+            with open(score_file_path, "rb") as f:
                 score_data = pickle.load(f)
-        except Exception:
+        except Exception as e:
+            print(f"Skipping {score_file_path}: {e}")
             continue
 
-        for cls_name, label in [("fp", 0), ("tp", 1), ("other", 1)]:
+        for cls_name, label in [("fp", 0), ("tp", 1)]:
             attn_entries = attn_data.get(cls_name, {}).get("image", [])
             score_entries = score_data.get(cls_name, [])
 
             for k in range(min(len(attn_entries), len(score_entries))):
                 e = attn_entries[k]
                 meta = attn_data.get(cls_name, {}).get("meta", [])[k]
-
+                
+                is_first_occ = meta.get("is_first_occ", False)
+                
+                if not is_first_occ:
+                    continue
+                
                 if not e.get("subtoken_results"):
                     continue
 
@@ -433,9 +456,10 @@ def plot_confusion_matrix(y_true, y_pred, classes, normalize=False, title='Confu
 
 
 
-def evaluate_on_real_data(classifier, data_dir, n_eval=100):
+def evaluate_on_real_data(classifier, attn_dir, score_dir, n_eval=100):
     samples = load_real_attention_samples(
-        data_dir,
+        attn_dir,
+        score_dir,
         n_samples=n_eval,
         n_layers=classifier.n_layers,
         n_heads=classifier.n_heads,
@@ -450,6 +474,7 @@ def evaluate_on_real_data(classifier, data_dir, n_eval=100):
             continue
 
         token_idx = sample["token_idx"]
+        token_idx = np.clip(token_idx, 5, 155) # hard-coded
         bayes_prob = preds[token_idx]["bayes_tp_prob"]
 
         y_true.append(label)
@@ -500,30 +525,39 @@ def evaluate_on_real_data(classifier, data_dir, n_eval=100):
 
     
 if __name__ == "__main__":
-    
-    classifier = FPAttentionClassifier(
-        model_path="results_all_layers/pytorch_mlp_exp__ent1_gin0/model/pytorch_mlp_with_l2.pt",
-        scaler_path="results_all_layers/pytorch_mlp_exp__ent1_gin0/model/scaler.pt",
+    classifier = BayesianInference(
+        model_path="final_cl_results_r/exp__bayes_ce/model/pytorch_mlp.pt",
+        prior_path="priors_r/prior_rt_mlp.pt",
+        scaler_path="final_cl_results_r/exp__bayes_ce/model/scaler.pt",
         n_layers=32,
         n_heads=32,
         use_entropy=True,
-        use_gini=False,
+        use_logits=True,
     )
 
-    # Dummy attention data for testing
-    sample = {
-        0: np.random.rand(32, 32, 20),
-        3: np.random.rand(32, 32, 20),
-        10: np.random.rand(32, 32, 20),
-        20: np.random.rand(32, 32, 20),
+    # Dummy test
+    dummy_sample = {
+        "token_idx": 10,
+        "topk_attn": np.random.rand(32, 32, 20),
+        "topk_attn_next": np.random.rand(32, 32, 20),
+        "logits": np.random.randn(500),
+        "total_reps": 2,
     }
 
-    preds = classifier.predict(sample)
-    print("\nPredictions for a dummy sample:")
-    for idx, prob in preds.items():
-        print(f"Token {idx:>3}: {prob:.4f}")
-        
+    preds = classifier.predict([dummy_sample])
+    print("\nDummy prediction:")
+    for idx, out in preds.items():
+        print(
+            f"Token {idx}: "
+            f"raw={out['raw_tp_prob']:.4f}, "
+            f"bayes={out['bayes_tp_prob']:.4f}, "
+            f"pred={out['bayes_pred']}"
+        )
+
+    # Real data eval
     if False:
-        data_dir = "data/all layers all attention tp fp"
-        print("\nEvaluating classifier on real dataset samples...")
-        results = evaluate_on_real_data(classifier, data_dir, n_eval=3000)
+        attn_dir = "../../data/all layers all attention tp fp rep double r"
+        score_dir = "../../data/double_scores r"
+        evaluate_on_real_data(classifier, attn_dir, score_dir, n_eval=3000)
+
+
