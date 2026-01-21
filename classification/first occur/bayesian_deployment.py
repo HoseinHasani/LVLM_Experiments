@@ -292,52 +292,142 @@ class BayesianInference:
 
     # ---------- inference ----------
 
-    def predict(self, samples):
-        """
-        samples: list of dicts with keys:
-          {
-            "token_idx": int,
-            "topk_attn": (L,H,K),
-            "topk_attn_next": (L,H,K),
-            "logits": np.ndarray,
-            "total_reps": int
-          }
-        """
-        feats, token_ids = [], []
 
-        for s in samples:
-            idx = s["token_idx"]
-            idx = np.clip(idx, self.min_position, self.max_position)
+def predict(self, samples):
+    """
+    samples: list of dicts with this structure:
+        
+    sample_dict = {
+        "sentence_idx": int,
+        "token_idx": int,
+        "topk_attn": (L,H,K),
+        "topk_attn_next": (L,H,K),
+        "logits": np.ndarray,
+        "total_reps": int,
+        "rep_num": int,
+        "token_id": int,
+        "token": str,
+        "is_first_occ": bool,
+        "lemma": str,
+        "all_occurrence_indices": list[int],
+    }
+    
+    
 
-            feats.append(
-                self.extract_features(
-                    idx,
-                    s["topk_attn"],
-                    s["topk_attn_next"],
-                    s["logits"],
-                    s["total_reps"],
-                )
+    returns: list of dicts (same structure, enriched with predictions):
+        
+    {
+        ... original fields except heavy tensors ...,
+        "prior_probs": [p0, p1],
+        "raw_probs": [p0, p1],
+        "posterior_probs": [p0, p1],
+        "final_pred": int
+    }
+    """
+
+    if not samples:
+        return []
+
+    # --------------------------------------------------
+    # Group samples by (sentence_idx, token_idx)
+    # --------------------------------------------------
+    by_sentence = {}
+    for s in samples:
+        by_sentence.setdefault(s["sentence_idx"], []).append(s)
+
+    # Store predictions for first occurrences
+    first_occ_samples = []
+    first_occ_keys = []  # (sentence_idx, token_idx)
+
+    for sent_idx, sent_samples in by_sentence.items():
+        for s in sent_samples:
+            if s.get("is_first_occ", False):
+                first_occ_samples.append(s)
+                first_occ_keys.append((sent_idx, s["token_idx"]))
+
+    # --------------------------------------------------
+    # Feature extraction (ONLY first occurrences)
+    # --------------------------------------------------
+    feats = []
+    for s in first_occ_samples:
+        idx = int(np.clip(s["token_idx"], self.min_position, self.max_position))
+
+        feats.append(
+            self.extract_features(
+                token_idx=idx,
+                topk_attn=s["topk_attn"],
+                topk_attn_next=s["topk_attn_next"],
+                logits=s["logits"],
+                total_reps=s["total_reps"],
             )
-            token_ids.append(idx)
+        )
 
-        if not feats:
-            return {}
-
+    if feats:
         X = torch.tensor(np.stack(feats), device=self.device)
         X = (X - self.mean) / (self.std + 1e-6)
 
         with torch.no_grad():
             raw_post, bayes_post, bayes_pred = self.model(X)
+    else:
+        raw_post = bayes_post = bayes_pred = None
 
-        results = {}
-        for i, idx in enumerate(token_ids):
-            results[idx] = {
-                "raw_tp_prob": float(raw_post[i, 1]),
-                "bayes_tp_prob": float(bayes_post[i, 1]),
-                "bayes_pred": int(bayes_pred[i]),
-            }
+    # --------------------------------------------------
+    # Build lookup table for predictions
+    # --------------------------------------------------
+    pred_table = {}  # (sentence_idx, token_idx) -> prediction dict
 
-        return results
+    for i, (sent_idx, tok_idx) in enumerate(first_occ_keys):
+        pred_table[(sent_idx, tok_idx)] = {
+            "raw_probs": raw_post[i].cpu().tolist(),
+            "prior_probs": (
+                (bayes_post[i] / raw_post[i]).cpu().tolist()
+                if raw_post is not None
+                else None
+            ),
+            "posterior_probs": bayes_post[i].cpu().tolist(),
+            "final_pred": int(bayes_pred[i].item()),
+        }
+
+    # --------------------------------------------------
+    # Propagate predictions to repeated tokens
+    # --------------------------------------------------
+    outputs = []
+
+    for s in samples:
+        sent_idx = s["sentence_idx"]
+        tok_idx = s["token_idx"]
+
+        if s["is_first_occ"]:
+            src_key = (sent_idx, tok_idx)
+        else:
+            # Find the original token index
+            occs = s.get("all_occurrence_indices", [])
+            src_tok = occs[0] if occs else tok_idx
+            src_key = (sent_idx, src_tok)
+
+        pred = pred_table.get(src_key)
+
+        # Build output sample
+        out = dict(s)  # shallow copy
+
+        # Remove heavy tensors
+        out.pop("topk_attn", None)
+        out.pop("topk_attn_next", None)
+        out.pop("logits", None)
+
+        if pred is not None:
+            out.update(pred)
+        else:
+            out.update({
+                "raw_probs": None,
+                "prior_probs": None,
+                "posterior_probs": None,
+                "final_pred": None,
+            })
+
+        outputs.append(out)
+
+    return outputs
 
 
     
@@ -545,6 +635,7 @@ if __name__ == "__main__":
     }
 
     preds = classifier.predict([dummy_sample])
+    print(preds)
     print("\nDummy prediction:")
     for idx, out in preds.items():
         print(
