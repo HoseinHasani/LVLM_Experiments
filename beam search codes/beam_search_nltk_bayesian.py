@@ -1,13 +1,10 @@
 import nltk
 import copy
-import inspect
 import warnings
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Union
 import os
 import sys
 import torch
-import torch.distributed as dist
 from torch import nn
 
 from transformers.generation.logits_process import (
@@ -26,23 +23,16 @@ from classifier.mlp_deployment import FPAttentionClassifier
 
 from collections import defaultdict, Counter
 
-from transformers import CLIPProcessor, CLIPModel
-from PIL import Image
-import torchvision.transforms as T
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 import os
-import matplotlib.pyplot as plt 
-from llava.constants import IMAGE_TOKEN_INDEX
 import numpy as np
 import re
 import spacy
 nlp = spacy.load("en_core_web_sm", disable=["ner", "parser"])
 
 
-import re
-from typing import List
 
 
 def charpos_to_lemma(char_pos, word_spans):
@@ -54,17 +44,29 @@ def charpos_to_lemma(char_pos, word_spans):
                 return lemma
     return None
 
-def sort_select(scores):
-    return np.sort(scores[0])[-200:]
+def sort_select(logits):
+    return np.sort(logits)[-200:]
 
-def collect_scores_by_indices(score_records, llava_indices):
-    collected = []
-    for inds in llava_indices:
-        for i in inds:
-            if i < len(score_records):
-                collected.append([i, sort_select(score_records[i].cpu().numpy())])
-            break
-    return collected
+
+
+def first_subtoken_map(words, tokenizer):
+    """
+    Returns a dict mapping each word to a set of plausible first subtoken IDs,
+    including common inflectional variants (plural, -ed, -ing).
+    """
+    mapping = {}
+    for word in words:
+        token_ids_set = set()
+        # include original word and common variants
+        variants = [word, word + 's', word + 'es', word + 'ed', word + 'ing']
+        for var in variants:
+            ids = tokenizer(var, add_special_tokens=False)["input_ids"]
+            if len(ids) > 0:
+                token_ids_set.add(ids[0])
+        mapping[word] = token_ids_set
+    return mapping
+    
+
 
 def topk_batch(attn, k):
     # attn: (H, N)
@@ -72,30 +74,28 @@ def topk_batch(attn, k):
     vals, idx = torch.topk(attn, k=k, dim=-1)
     return vals, idx
 
+def halluscope_score(preds):
+    return 0
 
 def sentence_evaluator(
     candidate_attentions,
     candidate_logits,
-    classifier,
+    halluscope,
     token_offset,
     tokenizer,
-    output_ids=None,
+    fast_tokenizer,
+    output_ids,
     image_start_idx=35,
     image_length=576,
     topk=20,
-    layer_start=0,
-    layer_end=32,
-    use_nltk=False,  
 ):
     
-    samples_4_classifier = []
+    samples_4_classification = []
     
-    num_layers, num_heads, TOPK = 32, 32, 20
+    num_layers, num_heads, TOPK = 32, 32, topk
     
     sentence_len = len(candidate_attentions)
     
-    scores = candidate_logits
-    # tp_scores = collect_scores_by_indices(scores, tp_llava_indices)
     
     token_len = output_ids.shape[1]
     output_attentions = candidate_attentions
@@ -115,23 +115,6 @@ def sentence_evaluator(
     words = nltk.word_tokenize(gen_text.lower())
     tagged_sent = nltk.pos_tag(words)
     nouns = [[word,word] for word, tag in tagged_sent if "NN" in tag]
-
-        
-
-    def word_to_first_token_id(word):
-        ids = tokenizer(
-            word,
-            add_special_tokens=False
-        )["input_ids"]
-        return ids[0] if len(ids) > 0 else None
-
-
-    token_ids_set = set()
-    for w in words:
-        tid = word_to_first_token_id(w)
-        if tid is not None:
-            token_ids_set.add(tid)
-
 
     doc = nlp(gen_text)
 
@@ -157,10 +140,6 @@ def sentence_evaluator(
 
     # --- tokenizer offsets for generated text ---
 
-    fast_tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer.name_or_path,
-            use_fast=True
-        )
     
     enc = fast_tokenizer(
         gen_text,
@@ -183,23 +162,6 @@ def sentence_evaluator(
         lemma_to_indices[lemma].append(idx)
 
 
-    def first_subtoken_map(words, tokenizer):
-        """
-        Returns a dict mapping each word to a set of plausible first subtoken IDs,
-        including common inflectional variants (plural, -ed, -ing).
-        """
-        mapping = {}
-        for word in words:
-            token_ids_set = set()
-            # include original word and common variants
-            variants = [word, word + 's', word + 'es', word + 'ed', word + 'ing']
-            for var in variants:
-                ids = tokenizer(var, add_special_tokens=False)["input_ids"]
-                if len(ids) > 0:
-                    token_ids_set.add(ids[0])
-            mapping[word] = token_ids_set
-        return mapping
-    
 
     gen_text_first_subtoken_map = first_subtoken_map(words, tokenizer)
 
@@ -216,6 +178,7 @@ def sentence_evaluator(
 
     seen_lemmas_per_word = defaultdict(bool)
     skip_next = set()  # indices to skip
+    
 
     for idx, (token_id, (start_char, end_char)) in enumerate(zip(token_ids, offsets)):
             if tokenizer.decode([token_id]) == "cars":
@@ -253,7 +216,8 @@ def sentence_evaluator(
                 word_ids = tokenizer(lemma, add_special_tokens=False)["input_ids"]
                 skip_next.update(idx + i for i in range(1, len(word_ids)+1))
 
-
+            
+            logit = sort_select(candidate_logits[idx])
 
             topk_image_indices = np.zeros((num_layers, num_heads, TOPK), dtype=np.int64)
             topk_image_values  = np.zeros((num_layers, num_heads, TOPK), dtype=np.float32)
@@ -319,19 +283,19 @@ def sentence_evaluator(
                 "token_idx": idx,
                 "topk_attn": topk_image_values.copy(),
                 "topk_attn_next": topk_image_values_next.copy(),
-                "logits": None,
+                "logits": logit,
                 "total_reps": total_reps,
                 "rep_num": occurrence_num,
                 "token_id": token_id
                 }
 
 
-            samples_4_classifier.append(sample_dict)
+            samples_4_classification.append(sample_dict)
         
 
-    preds = classifier.predict([samples_4_classifier])
-
-    return preds
+    preds = halluscope.predict([samples_4_classification])
+    score = halluscope_score(preds)
+    return score
 
 
 
@@ -380,7 +344,6 @@ def sample_with_ensemble(
     ensemble_size: int = 10,
     pseudo_sentence_length: int = 20,
     search_start: int = 2,
-    use_nltk: bool = True,        # for POS tagging
     logits_processor: Optional[LogitsProcessorList] = None,
     stopping_criteria: Optional[StoppingCriteriaList] = None,
     logits_warper: Optional[LogitsProcessorList] = None,
@@ -400,6 +363,8 @@ def sample_with_ensemble(
     """
     classifier = getattr(self, "classifier", None)
     tokenizer = getattr(self, "tokenizer", None)
+    fast_tokenizer = getattr(self, "fast_tokenizer", None)
+    
     # ---------- Setup ----------
     logits_processor = logits_processor or LogitsProcessorList()
     logits_warper = logits_warper or LogitsProcessorList()
@@ -493,7 +458,8 @@ def sample_with_ensemble(
         # ---------- Evaluate candidates ----------
         for i in range(len(candidate_outputs)):
             candidate_scores.append(
-                sentence_evaluator(candidate_attentions[i], candidate_logits[i], classifier, total_generated, tokenizer, candidate_outputs[i], use_nltk=use_nltk)
+                sentence_evaluator(candidate_attentions[i], candidate_logits[i], classifier, total_generated,
+                                   tokenizer, fast_tokenizer, candidate_outputs[i])
             )
 
         total_generated += pseudo_sentence_length
