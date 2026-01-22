@@ -27,8 +27,40 @@ import numpy as np
 
 
 
-def halluscope_score(preds):
-    return 0
+def halluscope_score(preds, alpha=0.5, beta=0.3):
+    """
+    preds: list of dicts returned by halluscope.predict()
+
+    Scoring rule:
+        score = alpha * real_num - hall_num - beta * hall_tot_repeat
+
+    where (ONLY first occurrences are counted):
+        real_num = count(final_pred == 1)
+        hall_num = count(final_pred == 0)
+        hall_tot_repeat = sum(len(all_occurrence_indices)) for hallucinated nouns
+    """
+
+    real_num = 0
+    hall_num = 0
+    hall_tot_repeat = 0
+
+    for p in preds:
+        if not p.get("is_first_occ", False):
+            continue
+
+        pred = p.get("final_pred", None)
+        if pred is None:
+            continue
+
+        if pred == 1:
+            real_num += 1
+        elif pred == 0:
+            hall_num += 1
+            hall_tot_repeat += len(p.get("all_occurrence_indices", []))
+
+    score = alpha * real_num - hall_num - beta * hall_tot_repeat
+    
+    return score
 
 
 def sentence_evaluator(
@@ -44,7 +76,6 @@ def sentence_evaluator(
     topk=20,
 ):
     
-    
     samples_4_classification = sentence_data_extraction(candidate_attentions,
                                                         candidate_logits,
                                                         halluscope,
@@ -53,7 +84,7 @@ def sentence_evaluator(
                                                         fast_tokenizer,
                                                         output_ids)
 
-    preds = halluscope.predict([samples_4_classification])
+    preds = halluscope.predict(samples_4_classification)
     score = halluscope_score(preds)
     return score
 
