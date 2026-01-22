@@ -5,3 +5,6 @@
 *.txt
 *.pdf
 *.zip
+*.json
+*.jsonl
+classification/closed_source/__pycache__/chair.cpython-312.pyc
