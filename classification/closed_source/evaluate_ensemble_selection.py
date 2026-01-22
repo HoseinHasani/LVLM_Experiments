@@ -2,32 +2,52 @@ import os
 import json
 import glob
 import pickle
-import random
 from collections import defaultdict
+
+import nltk
+from nltk.corpus import wordnet
+from nltk.stem import WordNetLemmatizer
 
 from chair import CHAIR
 
 
-# --------------------
-# Paths & config
-# --------------------
+# ====================
+# Config
+# ====================
 ENS_FOLDER = "ens_data"
 COCO_PATH = "coco_annotations"
 CACHE_PATH = "chair.pkl"
 
-TMP_RANDOM_CAPS = "random_single_captions.jsonl"
-SAVE_DATASET_METRICS = "chair_random_dataset_metrics.json"
-SAVE_PER_IMAGE_METRICS = "chair_random_per_image_metrics.json"
+THRESHOLD_RATIO = 0.8   
+
+OUT_DIR = f"chair_smart_selection_thr_{THRESHOLD_RATIO:.2f}"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+TMP_SELECTED_CAPS = os.path.join(
+    OUT_DIR, f"selected_captions_thr_{THRESHOLD_RATIO:.2f}.jsonl"
+)
+SAVE_DATASET_METRICS = os.path.join(
+    OUT_DIR, f"chair_dataset_metrics_thr_{THRESHOLD_RATIO:.2f}.json"
+)
+SAVE_PER_IMAGE_INFO = os.path.join(
+    OUT_DIR, f"selection_details_thr_{THRESHOLD_RATIO:.2f}.json"
+)
 
 IMAGE_ID_KEY = "image_id"
 CAPTION_KEY = "caption"
 
-RANDOM_SEED = 22
+
+# ====================
+# NLTK setup (download once if needed)
+# ====================
+# nltk.download("punkt")
+# nltk.download("averaged_perceptron_tagger")
+# nltk.download("wordnet")
 
 
-# --------------------
-# Load / build evaluator
-# --------------------
+# ====================
+# CHAIR evaluator
+# ====================
 if os.path.exists(CACHE_PATH):
     evaluator = pickle.load(open(CACHE_PATH, "rb"))
     print(f"Loaded CHAIR evaluator from cache: {CACHE_PATH}")
@@ -37,37 +57,158 @@ else:
     print(f"Built and cached CHAIR evaluator: {CACHE_PATH}")
 
 
-random.seed(RANDOM_SEED)
+# ====================
+# NLP utilities
+# ====================
+def get_wordnet_pos(tag):
+    if tag.startswith('J'):
+        return wordnet.ADJ
+    elif tag.startswith('V'):
+        return wordnet.VERB
+    elif tag.startswith('N'):
+        return wordnet.NOUN
+    elif tag.startswith('R'):
+        return wordnet.ADV
+    else:
+        return None
 
+
+def process_caption(caption):
+    words = nltk.word_tokenize(caption.lower())
+    tagged = nltk.pos_tag(words)
+
+    wnl = WordNetLemmatizer()
+
+    tokens = []
+    lemma_to_indices = defaultdict(list)
+
+    for idx, (word, tag) in enumerate(tagged):
+        wn_pos = get_wordnet_pos(tag) or wordnet.NOUN
+        lemma = wnl.lemmatize(word, pos=wn_pos)
+
+        is_noun = tag.startswith("NN")
+
+        token = {
+            "word": word,
+            "lemma": lemma,
+            "pos": tag,
+            "is_noun": is_noun,
+            "position": idx,
+            "is_first_occurrence": False,
+            "group_indices": None,
+        }
+        tokens.append(token)
+
+        if is_noun:
+            lemma_to_indices[lemma].append(idx)
+
+    for lemma, indices in lemma_to_indices.items():
+        first_idx = indices[0]
+        for idx in indices:
+            tokens[idx]["is_first_occurrence"] = (idx == first_idx)
+            tokens[idx]["group_indices"] = indices
+
+    return tokens
+
+
+def score_caption(caption, threshold_pos):
+    tokens = process_caption(caption)
+
+    real_num = 0
+    hall_num = 0
+    hall_tot_repeat = 0
+
+    for tok in tokens:
+        if not tok["is_noun"]:
+            continue
+        if not tok["is_first_occurrence"]:
+            continue
+
+        if tok["position"] < threshold_pos:
+            real_num += 1
+        else:
+            hall_num += 1
+            hall_tot_repeat += len(tok["group_indices"])
+
+    score = 0.5 * real_num - hall_num - 0.3 * hall_tot_repeat
+
+    return {
+        "score": score,
+        "real_num": real_num,
+        "hall_num": hall_num,
+        "hall_tot_repeat": hall_tot_repeat,
+    }
+
+
+def select_best_caption(captions, threshold_ratio):
+    lengths = [len(nltk.word_tokenize(c)) for c in captions]
+    avg_len = sum(lengths) / len(lengths)
+    threshold_pos = int(threshold_ratio * avg_len)
+
+    best_idx = None
+    best_score = float("-inf")
+    all_scores = []
+
+    for i, cap in enumerate(captions):
+        res = score_caption(cap, threshold_pos)
+        all_scores.append(res)
+
+        if res["score"] > best_score:
+            best_score = res["score"]
+            best_idx = i
+
+    return {
+        "best_index": best_idx,
+        "best_score": best_score,
+        "avg_length": avg_len,
+        "threshold_pos": threshold_pos,
+        "all_scores": all_scores,
+    }
+
+
+# ====================
+# Main loop
+# ====================
 jsonl_files = sorted(glob.glob(os.path.join(ENS_FOLDER, "*.jsonl")))
 assert len(jsonl_files) > 0, "No jsonl files found in ens_data/"
 
-
-# --------------------
-# 1) Randomly select ONE caption per image
-# --------------------
 selected_entries = []
+selection_details = {}
 
 for path in jsonl_files:
     with open(path, "r") as f:
-        lines = [json.loads(l) for l in f]
+        entries = [json.loads(l) for l in f]
 
-    assert len(lines) > 0, f"No captions in {path}"
-    chosen = random.choice(lines)
-    selected_entries.append(chosen)
+    captions = [e["caption"] for e in entries]
 
-with open(TMP_RANDOM_CAPS, "w") as f:
-    for entry in selected_entries:
-        f.write(json.dumps(entry) + "\n")
+    sel = select_best_caption(captions, THRESHOLD_RATIO)
+    chosen_entry = entries[sel["best_index"]]
 
-print(f"Selected {len(selected_entries)} random captions → {TMP_RANDOM_CAPS}")
+    selected_entries.append(chosen_entry)
+
+    image_key = os.path.basename(path).replace(".jsonl", "")
+    selection_details[image_key] = {
+        "image_id": chosen_entry["image_id"],
+        "chosen_gen_id": chosen_entry.get("gen_id"),
+        "selection_info": sel,
+    }
 
 
-# --------------------
-# 2) Dataset-level CHAIR (single caption per image)
-# --------------------
+# ====================
+# Save selected captions
+# ====================
+with open(TMP_SELECTED_CAPS, "w") as f:
+    for e in selected_entries:
+        f.write(json.dumps(e) + "\n")
+
+print(f"Saved selected captions to {TMP_SELECTED_CAPS}")
+
+
+# ====================
+# Run CHAIR
+# ====================
 dataset_output = evaluator.compute_chair(
-    cap_file=TMP_RANDOM_CAPS,
+    cap_file=TMP_SELECTED_CAPS,
     image_id_key=IMAGE_ID_KEY,
     caption_key=CAPTION_KEY,
 )
@@ -77,31 +218,13 @@ dataset_metrics = dataset_output["overall_metrics"]
 with open(SAVE_DATASET_METRICS, "w") as f:
     json.dump(dataset_metrics, f, indent=2)
 
-print("\n=== DATASET-LEVEL CHAIR (RANDOM SINGLE CAPTION) ===")
+with open(SAVE_PER_IMAGE_INFO, "w") as f:
+    json.dump(selection_details, f, indent=2)
+
+
+print("\n=== CHAIR RESULTS (SMART SELECTION) ===")
+print(f"Threshold ratio: {THRESHOLD_RATIO}")
 for k, v in dataset_metrics.items():
     print(f"{k:10s}: {v * 100:.2f}")
 
-
-# --------------------
-# 3) Per-image metrics (one caption each)
-# --------------------
-per_image_metrics = {}
-
-for sent in dataset_output["sentences"]:
-    per_image_metrics[sent["image_id"]] = {
-        "image_id": sent["image_id"],
-        "gen_id": sent.get("gen_id"),
-        "metrics": sent["metrics"],
-        "caption": sent["caption"],
-    }
-
-with open(SAVE_PER_IMAGE_METRICS, "w") as f:
-    json.dump(per_image_metrics, f, indent=2)
-
-print(f"\nSaved per-image metrics to {SAVE_PER_IMAGE_METRICS}")
-
-
-# --------------------
-# Cleanup (optional)
-# --------------------
-# os.remove(TMP_RANDOM_CAPS)
+print(f"\nResults saved in folder: {OUT_DIR}")
