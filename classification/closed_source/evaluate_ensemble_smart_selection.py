@@ -3,7 +3,7 @@ import json
 import glob
 import pickle
 from collections import defaultdict
-
+import numpy as np
 import nltk
 from nltk.corpus import wordnet
 from nltk.stem import WordNetLemmatizer
@@ -14,13 +14,16 @@ from chair import CHAIR
 # ====================
 # Config
 # ====================
+
+THRESHOLD_RATIO = 0.7
+FILTER_COCO_OBJ = True
+
 ENS_FOLDER = "ens_data"
 COCO_PATH = "coco_annotations"
 CACHE_PATH = "chair.pkl"
+COCO_OBJ_PATH = "mscoco_objects.npy"
 
-THRESHOLD_RATIO = 0.8   
-
-OUT_DIR = f"chair_smart_selection_thr_{THRESHOLD_RATIO:.2f}"
+OUT_DIR = f"chair_ensemble/smart_selection_filter_{FILTER_COCO_OBJ}"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 TMP_SELECTED_CAPS = os.path.join(
@@ -36,6 +39,10 @@ SAVE_PER_IMAGE_INFO = os.path.join(
 IMAGE_ID_KEY = "image_id"
 CAPTION_KEY = "caption"
 
+if FILTER_COCO_OBJ:
+    mscoco_objects = np.load(COCO_OBJ_PATH)
+else:
+    mscoco_objects = None
 
 # ====================
 # NLTK setup (download once if needed)
@@ -73,7 +80,7 @@ def get_wordnet_pos(tag):
         return None
 
 
-def process_caption(caption):
+def process_caption(caption, mscoco_objects):
     words = nltk.word_tokenize(caption.lower())
     tagged = nltk.pos_tag(words)
 
@@ -83,10 +90,14 @@ def process_caption(caption):
     lemma_to_indices = defaultdict(list)
 
     for idx, (word, tag) in enumerate(tagged):
-        wn_pos = get_wordnet_pos(tag) or wordnet.NOUN
-        lemma = wnl.lemmatize(word, pos=wn_pos)
-
-        is_noun = tag.startswith("NN")
+        if tag.startswith("NN"):
+            lemma = wnl.lemmatize(word, pos=wordnet.NOUN)
+            is_noun = True
+        else:
+            lemma = word
+            is_noun = False
+            
+        is_noun = tag in {"NN", "NNS"} # Exclude NNP / NNPS
 
         token = {
             "word": word,
@@ -96,7 +107,13 @@ def process_caption(caption):
             "position": idx,
             "is_first_occurrence": False,
             "group_indices": None,
+            "is_coco_obj": None
         }
+        
+        if mscoco_objects is not None:
+            is_coco_obj = word in mscoco_objects or lemma in mscoco_objects
+            token["is_coco_obj"] = is_coco_obj
+            
         tokens.append(token)
 
         if is_noun:
@@ -111,8 +128,8 @@ def process_caption(caption):
     return tokens
 
 
-def score_caption(caption, threshold_pos):
-    tokens = process_caption(caption)
+def score_caption(caption, threshold_pos, mscoco_objects):
+    tokens = process_caption(caption, mscoco_objects)
 
     real_num = 0
     hall_num = 0
@@ -123,6 +140,9 @@ def score_caption(caption, threshold_pos):
             continue
         if not tok["is_first_occurrence"]:
             continue
+        if tok["is_coco_obj"] is not None:
+            if not tok["is_coco_obj"]:
+                continue
 
         if tok["position"] < threshold_pos:
             real_num += 1
@@ -130,7 +150,8 @@ def score_caption(caption, threshold_pos):
             hall_num += 1
             hall_tot_repeat += len(tok["group_indices"])
 
-    score = 0.5 * real_num - hall_num - 0.3 * hall_tot_repeat
+    print(real_num, hall_num, hall_tot_repeat)
+    score = 0.4 * real_num - hall_num - 0.4 * hall_tot_repeat
 
     return {
         "score": score,
@@ -140,8 +161,8 @@ def score_caption(caption, threshold_pos):
     }
 
 
-def select_best_caption(captions, threshold_ratio):
-    lengths = [len(nltk.word_tokenize(c)) for c in captions]
+def select_best_caption(captions, threshold_ratio, mscoco_objects):
+    lengths = [len(process_caption(c, mscoco_objects)) for c in captions]
     avg_len = sum(lengths) / len(lengths)
     threshold_pos = int(threshold_ratio * avg_len)
 
@@ -150,7 +171,7 @@ def select_best_caption(captions, threshold_ratio):
     all_scores = []
 
     for i, cap in enumerate(captions):
-        res = score_caption(cap, threshold_pos)
+        res = score_caption(cap, threshold_pos, mscoco_objects)
         all_scores.append(res)
 
         if res["score"] > best_score:
@@ -181,7 +202,7 @@ for path in jsonl_files:
 
     captions = [e["caption"] for e in entries]
 
-    sel = select_best_caption(captions, THRESHOLD_RATIO)
+    sel = select_best_caption(captions, THRESHOLD_RATIO, mscoco_objects)
     chosen_entry = entries[sel["best_index"]]
 
     selected_entries.append(chosen_entry)
