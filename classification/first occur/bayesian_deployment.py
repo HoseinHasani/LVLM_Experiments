@@ -293,141 +293,141 @@ class BayesianInference:
     # ---------- inference ----------
 
 
-def predict(self, samples):
-    """
-    samples: list of dicts with this structure:
-        
-    sample_dict = {
-        "sentence_idx": int,
-        "token_idx": int,
-        "topk_attn": (L,H,K),
-        "topk_attn_next": (L,H,K),
-        "logits": np.ndarray,
-        "total_reps": int,
-        "rep_num": int,
-        "token_id": int,
-        "token": str,
-        "is_first_occ": bool,
-        "lemma": str,
-        "all_occurrence_indices": list[int],
-    }
-    
-    
-
-    returns: list of dicts (same structure, enriched with predictions):
-        
-    {
-        ... original fields except heavy tensors ...,
-        "prior_probs": [p0, p1],
-        "raw_probs": [p0, p1],
-        "posterior_probs": [p0, p1],
-        "final_pred": int
-    }
-    """
-
-    if not samples:
-        return []
-
-    # --------------------------------------------------
-    # Group samples by (sentence_idx, token_idx)
-    # --------------------------------------------------
-    by_sentence = {}
-    for s in samples:
-        by_sentence.setdefault(s["sentence_idx"], []).append(s)
-
-    # Store predictions for first occurrences
-    first_occ_samples = []
-    first_occ_keys = []  # (sentence_idx, token_idx)
-
-    for sent_idx, sent_samples in by_sentence.items():
-        for s in sent_samples:
-            if s.get("is_first_occ", False):
-                first_occ_samples.append(s)
-                first_occ_keys.append((sent_idx, s["token_idx"]))
-
-    # --------------------------------------------------
-    # Feature extraction (ONLY first occurrences)
-    # --------------------------------------------------
-    feats = []
-    for s in first_occ_samples:
-        idx = int(np.clip(s["token_idx"], self.min_position, self.max_position))
-
-        feats.append(
-            self.extract_features(
-                token_idx=idx,
-                topk_attn=s["topk_attn"],
-                topk_attn_next=s["topk_attn_next"],
-                logits=s["logits"],
-                total_reps=s["total_reps"],
-            )
-        )
-
-    if feats:
-        X = torch.tensor(np.stack(feats), device=self.device)
-        X = (X - self.mean) / (self.std + 1e-6)
-
-        with torch.no_grad():
-            raw_post, bayes_post, bayes_pred = self.model(X)
-    else:
-        raw_post = bayes_post = bayes_pred = None
-
-    # --------------------------------------------------
-    # Build lookup table for predictions
-    # --------------------------------------------------
-    pred_table = {}  # (sentence_idx, token_idx) -> prediction dict
-
-    for i, (sent_idx, tok_idx) in enumerate(first_occ_keys):
-        pred_table[(sent_idx, tok_idx)] = {
-            "raw_probs": raw_post[i].cpu().tolist(),
-            "prior_probs": (
-                (bayes_post[i] / raw_post[i]).cpu().tolist()
-                if raw_post is not None
-                else None
-            ),
-            "posterior_probs": bayes_post[i].cpu().tolist(),
-            "final_pred": int(bayes_pred[i].item()),
+    def predict(self, samples):
+        """
+        samples: list of dicts with this structure:
+            
+        sample_dict = {
+            "sentence_idx": int,
+            "token_idx": int,
+            "topk_attn": (L,H,K),
+            "topk_attn_next": (L,H,K),
+            "logits": np.ndarray,
+            "total_reps": int,
+            "rep_num": int,
+            "token_id": int,
+            "token": str,
+            "is_first_occ": bool,
+            "lemma": str,
+            "all_occurrence_indices": list[int],
         }
-
-    # --------------------------------------------------
-    # Propagate predictions to repeated tokens
-    # --------------------------------------------------
-    outputs = []
-
-    for s in samples:
-        sent_idx = s["sentence_idx"]
-        tok_idx = s["token_idx"]
-
-        if s["is_first_occ"]:
-            src_key = (sent_idx, tok_idx)
+        
+        
+    
+        returns: list of dicts (same structure, enriched with predictions):
+            
+        {
+            ... original fields except heavy tensors ...,
+            "prior_probs": [p0, p1],
+            "raw_probs": [p0, p1],
+            "posterior_probs": [p0, p1],
+            "final_pred": int
+        }
+        """
+    
+        if not samples:
+            return []
+    
+        # --------------------------------------------------
+        # Group samples by (sentence_idx, token_idx)
+        # --------------------------------------------------
+        by_sentence = {}
+        for s in samples:
+            by_sentence.setdefault(s["sentence_idx"], []).append(s)
+    
+        # Store predictions for first occurrences
+        first_occ_samples = []
+        first_occ_keys = []  # (sentence_idx, token_idx)
+    
+        for sent_idx, sent_samples in by_sentence.items():
+            for s in sent_samples:
+                if s.get("is_first_occ", False):
+                    first_occ_samples.append(s)
+                    first_occ_keys.append((sent_idx, s["token_idx"]))
+    
+        # --------------------------------------------------
+        # Feature extraction (ONLY first occurrences)
+        # --------------------------------------------------
+        feats = []
+        for s in first_occ_samples:
+            idx = int(np.clip(s["token_idx"], self.min_position, self.max_position))
+    
+            feats.append(
+                self.extract_features(
+                    token_idx=idx,
+                    topk_attn=s["topk_attn"],
+                    topk_attn_next=s["topk_attn_next"],
+                    logits=s["logits"],
+                    total_reps=s["total_reps"],
+                )
+            )
+    
+        if feats:
+            X = torch.tensor(np.stack(feats), device=self.device)
+            X = (X - self.mean) / (self.std + 1e-6)
+    
+            with torch.no_grad():
+                raw_post, bayes_post, bayes_pred = self.model(X)
         else:
-            # Find the original token index
-            occs = s.get("all_occurrence_indices", [])
-            src_tok = occs[0] if occs else tok_idx
-            src_key = (sent_idx, src_tok)
-
-        pred = pred_table.get(src_key)
-
-        # Build output sample
-        out = dict(s)  # shallow copy
-
-        # Remove heavy tensors
-        out.pop("topk_attn", None)
-        out.pop("topk_attn_next", None)
-        out.pop("logits", None)
-
-        if pred is not None:
-            out.update(pred)
-        else:
-            out.update({
-                "raw_probs": None,
-                "prior_probs": None,
-                "posterior_probs": None,
-                "final_pred": None,
-            })
-
-        outputs.append(out)
-
-    return outputs
+            raw_post = bayes_post = bayes_pred = None
+    
+        # --------------------------------------------------
+        # Build lookup table for predictions
+        # --------------------------------------------------
+        pred_table = {}  # (sentence_idx, token_idx) -> prediction dict
+    
+        for i, (sent_idx, tok_idx) in enumerate(first_occ_keys):
+            pred_table[(sent_idx, tok_idx)] = {
+                "raw_probs": raw_post[i].cpu().tolist(),
+                "prior_probs": (
+                    (bayes_post[i] / raw_post[i]).cpu().tolist()
+                    if raw_post is not None
+                    else None
+                ),
+                "posterior_probs": bayes_post[i].cpu().tolist(),
+                "final_pred": int(bayes_pred[i].item()),
+            }
+    
+        # --------------------------------------------------
+        # Propagate predictions to repeated tokens
+        # --------------------------------------------------
+        outputs = []
+    
+        for s in samples:
+            sent_idx = s["sentence_idx"]
+            tok_idx = s["token_idx"]
+    
+            if s["is_first_occ"]:
+                src_key = (sent_idx, tok_idx)
+            else:
+                # Find the original token index
+                occs = s.get("all_occurrence_indices", [])
+                src_tok = occs[0] if occs else tok_idx
+                src_key = (sent_idx, src_tok)
+    
+            pred = pred_table.get(src_key)
+    
+            # Build output sample
+            out = dict(s)  # shallow copy
+    
+            # Remove heavy tensors
+            out.pop("topk_attn", None)
+            out.pop("topk_attn_next", None)
+            out.pop("logits", None)
+    
+            if pred is not None:
+                out.update(pred)
+            else:
+                out.update({
+                    "raw_probs": None,
+                    "prior_probs": None,
+                    "posterior_probs": None,
+                    "final_pred": None,
+                })
+    
+            outputs.append(out)
+    
+        return outputs
 
 
     
@@ -443,56 +443,39 @@ def load_real_attention_samples(
 ):
     attn_files = sorted(glob(os.path.join(attn_dir, "attentions_*.pkl")))
     score_files = sorted(glob(os.path.join(score_dir, "scores_*.pkl")))
+
     samples = []
-    
-    attn_files_dict = {}
-    for f in attn_files:
-        key = int(os.path.splitext(os.path.basename(f))[0].split('_')[1])
-        attn_files_dict[key] = f
 
-    score_files_dict = {}
-    for f in score_files:
-        key = int(os.path.splitext(os.path.basename(f))[0].split('_')[1])
-        score_files_dict[key] = f
+    attn_files_dict = {
+        int(os.path.splitext(os.path.basename(f))[0].split("_")[1]): f
+        for f in attn_files
+    }
+    score_files_dict = {
+        int(os.path.splitext(os.path.basename(f))[0].split("_")[1]): f
+        for f in score_files
+    }
 
-
-    attn_ids = list(attn_files_dict.keys())
-    score_ids = list(score_files_dict.keys())
-
-    intersect_ids = list(set(attn_ids).intersection(set(score_ids)))
+    intersect_ids = sorted(set(attn_files_dict) & set(score_files_dict))
 
     for id_ in intersect_ids[:n_samples]:
-        attn_file_path = attn_files_dict[id_]
-        score_file_path = score_files_dict[id_]
-        
         try:
-            with open(attn_file_path, "rb") as f:
+            with open(attn_files_dict[id_], "rb") as f:
                 attn_data = pickle.load(f)
-        except Exception as e:
-            print(f"Skipping {attn_file_path}: {e}")
-            continue
-
-
-        try:
-            with open(score_file_path, "rb") as f:
+            with open(score_files_dict[id_], "rb") as f:
                 score_data = pickle.load(f)
         except Exception as e:
-            print(f"Skipping {score_file_path}: {e}")
+            print(f"Skipping sentence {id_}: {e}")
             continue
 
         for cls_name, label in [("fp", 0), ("tp", 1)]:
             attn_entries = attn_data.get(cls_name, {}).get("image", [])
             score_entries = score_data.get(cls_name, [])
+            meta_entries = attn_data.get(cls_name, {}).get("meta", [])
 
-            for k in range(min(len(attn_entries), len(score_entries))):
+            for k in range(min(len(attn_entries), len(score_entries), len(meta_entries))):
                 e = attn_entries[k]
-                meta = attn_data.get(cls_name, {}).get("meta", [])[k]
-                
-                is_first_occ = meta.get("is_first_occ", False)
-                
-                if not is_first_occ:
-                    continue
-                
+                meta = meta_entries[k]
+
                 if not e.get("subtoken_results"):
                     continue
 
@@ -512,22 +495,34 @@ def load_real_attention_samples(
                 topk_vals_next = topk_vals_next[..., :n_top_k]
 
                 logits = np.array(score_entries[k][1], dtype=float)
-                total_reps = meta.get("total_reps", 1)
 
-                samples.append(
-                    (
-                        {
-                            "token_idx": idx,
-                            "topk_attn": topk_vals,
-                            "topk_attn_next": topk_vals_next,
-                            "logits": logits,
-                            "total_reps": total_reps,
-                        },
-                        label,
-                    )
-                )
+                total_reps = meta.get("total_reps", 1)
+                rep_num = meta.get("rep_num", 1)
+                all_occurrence_indices = meta.get("all_occurrence_indices", [idx])
+                is_first_occ = meta.get("is_first_occ", False)
+
+                token_id = meta.get("token_id", -1)
+                lemma = meta.get("lemma", None)
+
+                sample = {
+                    "sentence_idx": id_,
+                    "token_idx": idx,
+                    "topk_attn": topk_vals,
+                    "topk_attn_next": topk_vals_next,
+                    "logits": logits,
+                    "total_reps": total_reps,
+                    "rep_num": rep_num,
+                    "token_id": token_id,
+                    "token": None,
+                    "lemma": lemma,
+                    "is_first_occ": is_first_occ,
+                    "all_occurrence_indices": all_occurrence_indices,
+                }
+
+                samples.append((sample, label))
 
     return samples
+
 
 
 
@@ -646,7 +641,7 @@ if __name__ == "__main__":
         )
 
     # Real data eval
-    if False:
+    if True:
         attn_dir = "../../data/all layers all attention tp fp rep double r"
         score_dir = "../../data/double_scores r"
         evaluate_on_real_data(classifier, attn_dir, score_dir, n_eval=3000)
