@@ -329,26 +329,19 @@ class BayesianInference:
             return []
     
         # --------------------------------------------------
-        # Group samples by (sentence_idx, token_idx)
+        # Collect first-occurrence samples
         # --------------------------------------------------
-        by_sentence = {}
-        for s in samples:
-            by_sentence.setdefault(s["sentence_idx"], []).append(s)
-    
-        # Store predictions for first occurrences
         first_occ_samples = []
-        first_occ_keys = []  # (sentence_idx, token_idx)
-    
-        for sent_idx, sent_samples in by_sentence.items():
-            for s in sent_samples:
-                if s.get("is_first_occ", False):
-                    first_occ_samples.append(s)
-                    first_occ_keys.append((sent_idx, s["token_idx"]))
+        for s in samples:
+            if s.get("is_first_occ", False):
+                first_occ_samples.append(s)
     
         # --------------------------------------------------
         # Feature extraction (ONLY first occurrences)
         # --------------------------------------------------
         feats = []
+        keys = []  # (sentence_idx, token_idx)
+    
         for s in first_occ_samples:
             idx = int(np.clip(s["token_idx"], self.min_position, self.max_position))
     
@@ -361,6 +354,7 @@ class BayesianInference:
                     total_reps=s["total_reps"],
                 )
             )
+            keys.append((s["sentence_idx"], s["token_idx"]))
     
         if feats:
             X = torch.tensor(np.stack(feats), device=self.device)
@@ -372,45 +366,37 @@ class BayesianInference:
             raw_post = bayes_post = bayes_pred = None
     
         # --------------------------------------------------
-        # Build lookup table for predictions
+        # Build FULL prediction table via first occurrences
         # --------------------------------------------------
-        pred_table = {}  # (sentence_idx, token_idx) -> prediction dict
+        pred_table = {}  # (sentence_idx, token_idx) -> prediction
     
-        for i, (sent_idx, tok_idx) in enumerate(first_occ_keys):
-            pred_table[(sent_idx, tok_idx)] = {
+        for i, s in enumerate(first_occ_samples):
+            sent_idx = s["sentence_idx"]
+    
+            pred = {
                 "raw_probs": raw_post[i].cpu().tolist(),
-                "prior_probs": (
-                    (bayes_post[i] / raw_post[i]).cpu().tolist()
-                    if raw_post is not None
-                    else None
-                ),
+                "prior_probs": (bayes_post[i] / raw_post[i]).cpu().tolist(),
                 "posterior_probs": bayes_post[i].cpu().tolist(),
                 "final_pred": int(bayes_pred[i].item()),
             }
     
+            all_occurrence_indices = s["all_occurrence_indices"]
+            if len(all_occurrence_indices) < 1:
+                all_occurrence_indices = [s["token_idx"]]
+            # Assign to ALL occurrences listed by the first-occ token
+            for tok_idx in all_occurrence_indices:
+                pred_table[(sent_idx, tok_idx)] = pred
+    
         # --------------------------------------------------
-        # Propagate predictions to repeated tokens
+        # Build outputs (order preserved)
         # --------------------------------------------------
         outputs = []
     
         for s in samples:
-            sent_idx = s["sentence_idx"]
-            tok_idx = s["token_idx"]
+            key = (s["sentence_idx"], s["token_idx"])
+            pred = pred_table.get(key)
     
-            if s["is_first_occ"]:
-                src_key = (sent_idx, tok_idx)
-            else:
-                # Find the original token index
-                occs = s.get("all_occurrence_indices", [])
-                src_tok = occs[0] if occs else tok_idx
-                src_key = (sent_idx, src_tok)
-    
-            pred = pred_table.get(src_key)
-    
-            # Build output sample
-            out = dict(s)  # shallow copy
-    
-            # Remove heavy tensors
+            out = dict(s)
             out.pop("topk_attn", None)
             out.pop("topk_attn_next", None)
             out.pop("logits", None)
@@ -542,7 +528,7 @@ def plot_confusion_matrix(y_true, y_pred, classes, normalize=False, title='Confu
 
 
 def evaluate_on_real_data(classifier, attn_dir, score_dir, n_eval=100):
-    samples = load_real_attention_samples(
+    data = load_real_attention_samples(
         attn_dir,
         score_dir,
         n_samples=n_eval,
@@ -551,41 +537,42 @@ def evaluate_on_real_data(classifier, attn_dir, score_dir, n_eval=100):
         n_top_k=classifier.n_top_k,
     )
 
-    y_true, y_pred = [], []
-
-    for sample, label in tqdm(samples, desc="Evaluating"):
-        preds = classifier.predict([sample])
-        if not preds:
-            continue
-
-        token_idx = sample["token_idx"]
-        token_idx = np.clip(token_idx, 5, 155) # hard-coded
-        bayes_prob = preds[token_idx]["bayes_tp_prob"]
-
-        y_true.append(label)
-        y_pred.append(bayes_prob)
-
-    if not y_true:
-        print("No valid samples found for evaluation.")
+    if not data:
+        print("No samples loaded.")
         return
 
+    samples = [s for s, _ in data]
+    labels = {(s["sentence_idx"], s["token_idx"]): y for s, y in data}
+
+    preds = classifier.predict(samples)
+
+    y_true, y_pred = [], []
+
+    for out in preds:
+        if out['final_pred'] is None:
+            continue
+
+        key = (out["sentence_idx"], out["token_idx"])
+        if key not in labels:
+            continue
+
+        y_true.append(labels[key])
+        y_pred.append(out["posterior_probs"][1])
+
+    if not y_true:
+        print("No valid first-occurrence samples for evaluation.")
+        return
+
+    y_true = np.array(y_true)
     y_pred = np.array(y_pred)
     y_bin = (y_pred > 0.5).astype(int)
-
-    print(
-        "Bayes prob stats:",
-        np.max(y_pred),
-        np.min(y_pred),
-        np.mean(y_pred),
-        np.std(y_pred),
-    )
 
     acc = accuracy_score(y_true, y_bin)
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true, y_bin, average="binary"
     )
 
-    print(f"\n=== Bayesian Evaluation on {len(y_true)} Samples ===")
+    print(f"\n=== Bayesian Evaluation ({len(y_true)} samples) ===")
     print(f"Accuracy:  {acc:.3f}")
     print(f"Precision: {precision:.3f}")
     print(f"Recall:    {recall:.3f}")
@@ -599,12 +586,7 @@ def evaluate_on_real_data(classifier, attn_dir, score_dir, n_eval=100):
         title="Bayesian Confusion Matrix",
     )
 
-    return {
-        "accuracy": acc,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-    }
+    return dict(accuracy=acc, precision=precision, recall=recall, f1=f1)
 
 
 
@@ -620,30 +602,53 @@ if __name__ == "__main__":
         use_logits=True,
     )
 
-    # Dummy test
-    dummy_sample = {
-        "token_idx": 10,
-        "topk_attn": np.random.rand(32, 32, 20),
-        "topk_attn_next": np.random.rand(32, 32, 20),
-        "logits": np.random.randn(500),
-        "total_reps": 2,
-    }
+    dummy_samples = [
+        {
+            "sentence_idx": 0,
+            "token_idx": 10,
+            "topk_attn": np.random.rand(32, 32, 20),
+            "topk_attn_next": np.random.rand(32, 32, 20),
+            "logits": np.random.randn(500),
+            "total_reps": 2,
+            "rep_num": 1,
+            "token_id": 123,
+            "token": "dummy",
+            "lemma": "dummy",
+            "is_first_occ": True,
+            "all_occurrence_indices": [10, 25],
+        },
+        {
+            "sentence_idx": 0,
+            "token_idx": 25,
+            "topk_attn": None,
+            "topk_attn_next": None,
+            "logits": None,
+            "total_reps": 2,
+            "rep_num": 2,
+            "token_id": 123,
+            "token": "dummy",
+            "lemma": "dummy",
+            "is_first_occ": False,
+            "all_occurrence_indices": [25],
+        },
+    ]
 
-    preds = classifier.predict([dummy_sample])
+    preds = classifier.predict(dummy_samples)
     print(preds)
-    print("\nDummy prediction:")
-    for idx, out in preds.items():
+    print("\nDummy predictions:")
+    for p in preds:
         print(
-            f"Token {idx}: "
-            f"raw={out['raw_tp_prob']:.4f}, "
-            f"bayes={out['bayes_tp_prob']:.4f}, "
-            f"pred={out['bayes_pred']}"
+            f"[sent={p['sentence_idx']} idx={p['token_idx']}] "
+            f"raw={p['raw_probs']} "
+            f"post={p['posterior_probs']} "
+            f"pred={p['final_pred']}"
         )
 
-    # Real data eval
-    if True:
+    if False:
+        # Real data eval
         attn_dir = "../../data/all layers all attention tp fp rep double r"
         score_dir = "../../data/double_scores r"
+    
         evaluate_on_real_data(classifier, attn_dir, score_dir, n_eval=3000)
 
 
