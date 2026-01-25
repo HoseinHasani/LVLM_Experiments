@@ -19,7 +19,7 @@ from collections import defaultdict
 
 
 #######################
-load_from_existing = False
+load_from_existing = True
 target_rep = 1
 
 target_class = 'tp'
@@ -34,16 +34,11 @@ use_logits = True
 use_attns = True
 #######################
 
-attn_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/Ensemble/experiments/new_per_sample_outputs/attentions_greedy_rep_aware_double"
-score_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/Ensemble/experiments/new_per_sample_outputs/scores_greedy_rep_aware_double"
-priors_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/final_cl_results/priors"
-base_save_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/final_cl_results"
+attn_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/Ensemble/experiments/new_per_sample_outputs/minigpt_attentions_temp05_rep_aware_double_e2e_5000_other_nouns"
+score_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/Ensemble/experiments/new_per_sample_outputs/minigpt_scores_temp05_rep_aware_double_e2e_5000_other_nouns"
+priors_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/minigpt_temp05_final_joint_cl_results/priors"
+base_save_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/minigpt_temp05_final_joint_cl_results"
 
-attn_dir = "../../data/all layers all attention tp fp rep double r"
-score_dir = "../../data/double_scores r"
-
-priors_dir = "priors_r"
-base_save_dir = "final_cl_results_r"
 
 os.makedirs(base_save_dir, exist_ok=True)
 os.makedirs(priors_dir, exist_ok=True)
@@ -81,8 +76,11 @@ exp_name = f"exp__bayes_ce{sfx}"
 save_dir = os.path.join(base_save_dir, exp_name)
 model_dir = os.path.join(save_dir, "model")
 results_dir = os.path.join(save_dir, "results")
+priors_dir = os.path.join(priors_dir, exp_name)
+os.makedirs(priors_dir, exist_ok=True)
 os.makedirs(model_dir, exist_ok=True)
 os.makedirs(results_dir, exist_ok=True)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"\nUsing device: {device}")
 
@@ -242,32 +240,33 @@ def extract_all_features(attn_file_dict, score_file_dict, file_ids, n_layers, n_
     return np.array(X), np.array(y), np.array(pos_list), np.array(cls_list), np.array(lemma_list, dtype=object), np.array(all_occ_ind_list, dtype=object), rep_list
 
 
-def upsample_to_target(indices, target_size, rng):
+def upsample_class_fractional(
+    indices,
+    target_size,
+    rng,
+    max_repeat=40,
+):
     """
-    Upsample a set of indices to exactly target_size using:
-    - zero or one full repetition
-    - remaining samples without replacement
+    Upsample indices to target_size using:
+    - integer repetition
+    - fractional sampling without replacement
     """
     n = len(indices)
     if n == 0:
         return []
 
-    if n >= target_size:
-        return rng.choice(indices, size=target_size, replace=False).tolist()
+    r = target_size / n
+    k = int(np.floor(r))
+    k = min(k, max_repeat)
 
-    # At most one full repetition
-    reps = target_size // n
-    reps = min(reps, 1)
-
-    out = indices * reps
+    out = indices * k
     remaining = target_size - len(out)
 
-    pool = indices.copy()
-    if remaining > len(pool):
-        # one extra repetition allowed, still capped
-        pool = pool + indices
+    if remaining > 0:
+        remaining = min(remaining, n)
+        sampled = rng.choice(indices, size=remaining, replace=False).tolist()
+        out += sampled
 
-    out += rng.choice(pool, size=remaining, replace=False).tolist()
     return out
 
 
@@ -275,56 +274,60 @@ def upsample_to_target(indices, target_size, rng):
 def balance_samples_by_position(
     X, y, pos, cls, lmm, occ, reps,
     classes=("fp", "tp"),
+    win=2,
+    max_repeat=40,
     random_state=0,
 ):
-    """
-    Balance samples per token position.
-    
-    Parameters
-    ----------
-    classes : tuple
-        ("fp", "tp") or ("fp", "tp", "other")
-    """
     rng = np.random.default_rng(random_state)
 
-    X_out, y_out, pos_out, cls_out, lmm_out, occ_out, reps_out = [], [], [], [], [], [], []
+    X_bal, y_bal, pos_bal, cls_bal, lmm_bal, occ_bal, reps_bal = \
+        [X], [y], [pos], [cls], [lmm], [occ], [reps]
 
-    unique_positions = np.unique(pos)
+    min_pos, max_pos = int(pos.min()), int(pos.max())
 
-    for p in unique_positions:
-        mask_p = (pos == p)
+    for j in range(min_pos, max_pos + 1):
+        # window mask
+        mask_w = (pos >= j - win) & (pos <= j + win)
 
         # collect indices per class
-        class_to_indices = {}
-        for c in classes:
-            class_to_indices[c] = np.where(mask_p & (cls == c))[0].tolist()
+        class_indices = {
+            c: np.where(mask_w & (cls == c))[0].tolist()
+            for c in classes
+        }
 
-        # target size = max class count at this position
-        target = max(len(v) for v in class_to_indices.values())
-        if target == 0:
+        # remove empty classes
+        present = {c: idxs for c, idxs in class_indices.items() if len(idxs) > 0}
+        if len(present) < 2:
             continue
 
-        for c, idxs in class_to_indices.items():
-            balanced_idxs = upsample_to_target(idxs, target, rng)
+        # target size
+        N_star = max(len(v) for v in present.values())
 
-            X_out.append(X[balanced_idxs])
-            y_out.append(y[balanced_idxs])
-            pos_out.append(pos[balanced_idxs])
-            cls_out.append(cls[balanced_idxs])
-            lmm_out.append(lmm[balanced_idxs])
-            occ_out.append(occ[balanced_idxs])
-            reps_out.append(reps[balanced_idxs])
+        for c, idxs in present.items():
+            up_idx = upsample_class_fractional(
+                idxs,
+                target_size=N_star,
+                rng=rng,
+                max_repeat=max_repeat,
+            )
+
+            X_bal.append(X[up_idx])
+            y_bal.append(y[up_idx])
+            pos_bal.append(pos[up_idx])
+            cls_bal.append(cls[up_idx])
+            lmm_bal.append(lmm[up_idx])
+            occ_bal.append(occ[up_idx])
+            reps_bal.append(reps[up_idx])
 
     return (
-        np.concatenate(X_out, axis=0),
-        np.concatenate(y_out, axis=0),
-        np.concatenate(pos_out, axis=0),
-        np.concatenate(cls_out, axis=0),
-        np.concatenate(lmm_out, axis=0),
-        np.concatenate(occ_out, axis=0),
-        np.concatenate(reps_out, axis=0),
+        np.concatenate(X_bal, axis=0),
+        np.concatenate(y_bal, axis=0),
+        np.concatenate(pos_bal, axis=0),
+        np.concatenate(cls_bal, axis=0),
+        np.concatenate(lmm_bal, axis=0),
+        np.concatenate(occ_bal, axis=0),
+        np.concatenate(reps_bal, axis=0),
     )
-
 
 
 
@@ -384,7 +387,10 @@ if dataset_path and os.path.exists(f"{dataset_path}/x.npy") and load_from_existi
     y_all = np.load(f"{dataset_path}/y.npy")
     pos_all = np.load(f"{dataset_path}/pos.npy")
     cls_all = np.load(f"{dataset_path}/cls.npy")
-    lemma_all = np.load(f"{dataset_path}/lemma.npy")
+    lemma_all = np.load(f"{dataset_path}/lemma.npy", allow_pickle=True)
+    all_occ_list_all = np.load(f"{dataset_path}/occ_indices.npy", allow_pickle=True)
+    reps_all = np.load(f"{dataset_path}/repeats.npy", allow_pickle=True)
+
 else:
     X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all, reps_all = extract_all_features(
         attn_files_dict, score_files_dict, intersect_ids, n_layers, n_heads, min_position, max_position
@@ -428,8 +434,7 @@ if tp_dropout > 0:
     X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all, reps_all = drop_samples(
         X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all, reps_all, target="tp", dropout_ratio=other_dropout
     )
-
-
+    
 reps_org = reps_all.copy()
 
 # -----------------------------
@@ -453,8 +458,9 @@ reps_train, reps_test = reps_all[:n_train], reps_all[-n_test:]
 X_train_original = X_all #X_train.copy()
 y_train_original = y_all #y_train.copy()
 
+
 # -----------------------------
-# Apply Adaptive FP Balancing
+# Apply Adaptive  Balancing
 # -----------------------------
 
 if balanced_train:
@@ -501,12 +507,6 @@ def fill_nans_linear(x):
     )
     return x_filled
 
-
-positions = np.arange(min_position, max_position + 1)
-
-# -----------------------------
-# Empirical position priors p(y | t) from original dataset
-# -----------------------------
 
 # Use ORIGINAL (unbalanced) data
 pos_orig = pos_all          # token positions
@@ -589,6 +589,7 @@ np.save(
 
 
 
+
 # ============================================================
 # Learn joint prior p(y | r, t) using a small MLP
 # ============================================================
@@ -604,6 +605,8 @@ class PriorRTNet(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
 
 
 # ------------------------------------------------------------
@@ -630,6 +633,7 @@ prior_optimizer = torch.optim.Adam(
     prior_net.parameters(), lr=1e-3, weight_decay=1e-4
 )
 prior_criterion = nn.CrossEntropyLoss(label_smoothing=0.02)
+
 
 
 prior_dataset = TensorDataset(X_prior_t, y_prior_t)
@@ -672,6 +676,7 @@ for p in prior_net.parameters():
 
 torch.save(prior_net.state_dict(), os.path.join(priors_dir, "prior_rt_mlp.pt"))
 print("Joint prior network trained and saved.")
+
 
 
 
@@ -802,6 +807,8 @@ class BayesianMLPClassifier(nn.Module):
         # Bayesian correction
         # ----------------------------------
         bayes_unnormalized = raw_posteriors * priors_rt
+        # * priors_rt
+        # 
         bayes_posteriors = bayes_unnormalized / (
             bayes_unnormalized.sum(dim=1, keepdim=True) + 1e-8
         )
