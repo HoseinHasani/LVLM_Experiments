@@ -5,11 +5,15 @@ import numpy as np
 import torch
 from nltk.corpus import wordnet as wn
 
-nlp = spacy.load("en_core_web_sm", disable=["ner", "parser"])
-nltk.download("punkt")
-nltk.download("averaged_perceptron_tagger")
-nltk.download("wordnet")
-nltk.download("omw-1.4")
+# nlp = spacy.load("en_core_web_sm", disable=["ner", "parser"])
+nlp = spacy.load("en_core_web_sm", disable=["ner"])
+# nltk.download("punkt")
+# nltk.download("averaged_perceptron_tagger")
+# nltk.download("wordnet")
+# nltk.download("omw-1.4")
+from nltk.stem import WordNetLemmatizer
+from nltk.corpus import wordnet
+
 
 def charpos_to_lemma(char_pos, word_spans):
     for word, lemma, start, end in word_spans:
@@ -20,7 +24,7 @@ def charpos_to_lemma(char_pos, word_spans):
     return None
 
 def sort_select(logits):
-    return np.sort(logits.cpu())[-200:]
+    return np.sort(logits.cpu().numpy())[-200:]
 
 
 def topk_batch(attn, k):
@@ -28,6 +32,18 @@ def topk_batch(attn, k):
     vals, idx = torch.topk(attn, k=k, dim=-1)
     return vals, idx
 
+
+def get_wordnet_pos(tag):
+        if tag.startswith('J'):
+            return wordnet.ADJ
+        elif tag.startswith('V'):
+            return wordnet.VERB
+        elif tag.startswith('N'):
+            return wordnet.NOUN
+        elif tag.startswith('R'):
+            return wordnet.ADV
+        else:
+            return None
 
 PHYSICAL_OBJECT_ROOTS = {
     "artifact.n.01",
@@ -37,14 +53,22 @@ PHYSICAL_OBJECT_ROOTS = {
     "whole.n.02",  # optional for "image" or composite objects
 }
 
-def is_object_noun(token):
+def is_object_noun(token, nltk_obj, nltk_all):
     """
     Return True if token is a noun and corresponds to a physical object in WordNet.
     Traverses hypernyms recursively.
     """
-    if token.pos_ not in {"NOUN", "PROPN"}:
-        return False
+    selected_words = ["ski", "airplane","remote","laptop", "plane", "lap"]
 
+    lemma = token.lemma_.lower()
+    if lemma in nltk_all:
+        if lemma not in nltk_obj:
+            return False
+    else:
+        if token.pos_ not in {"NOUN", "PROPN"}:
+            if token.text in selected_words:
+                return True
+            return False
     # lemma = token.lemma_.lower()
     # synsets = wn.synsets(lemma, pos=wn.NOUN)
     # if not synsets:
@@ -76,6 +100,7 @@ def sentence_data_extraction(
     image_length=576,
     topk=20,
     mscoco_objects=None,
+    skip_end=False
 ):
     """
     Extract per-token data for classification, only for object-related tokens.
@@ -94,6 +119,22 @@ def sentence_data_extraction(
     word_spans = [(token.text, token.lemma_.lower(), token.idx, token.idx + len(token.text))
                   for token in doc if not token.is_space and not token.is_punct]
 
+
+    nltk_words = nltk.word_tokenize(gen_text.lower())
+    tagged_sent = nltk.pos_tag(nltk_words)
+    nltk_lemmas_obj = []
+    nltk_lemmas_all = []
+    wnl = WordNetLemmatizer()
+    for tag in tagged_sent:
+        wordnet_pos = get_wordnet_pos(tag[1]) 
+        if wordnet_pos:
+            nltk_lemmas_all.append(wnl.lemmatize(tag[0], pos=wordnet_pos))
+        if tag[1].startswith("NN"):
+            nltk_lemmas_obj.append(wnl.lemmatize(tag[0], pos=wordnet_pos))
+
+
+    
+    
     lemmas = [lemma for _, lemma, _, _ in word_spans]
     lemma_total_counter = Counter(lemmas)
     lemma_occurrence_counter = defaultdict(int)
@@ -120,7 +161,10 @@ def sentence_data_extraction(
     skip_next = set()
 
     # --- Identify object nouns ---
-    object_nouns = [t for t in doc if is_object_noun(t)]
+    ####################################
+    object_nouns = [t for t in doc if is_object_noun(t, nltk_lemmas_obj, nltk_lemmas_all)]
+
+###########################
     object_char_spans = [(t.idx, t.idx + len(t.text)) for t in object_nouns]
 
     # Build subtoken mask
@@ -132,8 +176,12 @@ def sentence_data_extraction(
             continue
         object_token_mask.append(start in object_word_starts)
 
-    # --- Loop through tokens ---
-    for idx, (token_id, (start_char, end_char)) in enumerate(zip(token_ids, offsets)):
+
+    if len(token_ids) < token_offset:
+        print("\n WARNING!! len(token_ids) < token_offset\n")
+
+
+    for idx, (token_id, (start_char, end_char)) in enumerate(zip(token_ids[:token_offset], offsets[:token_offset])):
         if not object_token_mask[idx]:
             continue  # skip non-object tokens
 
@@ -149,8 +197,32 @@ def sentence_data_extraction(
             lemma_occurrence_counter[lemma] += 1
             seen_lemmas_per_word[start_char] = True
 
+
+    # --- Loop through tokens ---
+    for idx, (token_id, (start_char, end_char)) in enumerate(zip(token_ids[token_offset:], offsets[token_offset:])):
+        if skip_end and idx==(len(token_ids) - token_offset - 1):
+            break
+        
+        if not object_token_mask[idx+token_offset]:
+            continue  # skip non-object tokens
+
+        lemma = charpos_to_lemma(start_char, word_spans)
+        if lemma is None:
+            continue
+
+        if (idx+token_offset) in skip_next:
+            continue
+
+        # Update occurrence counts
+        if not seen_lemmas_per_word.get(start_char, False):
+            lemma_occurrence_counter[lemma] += 1
+            seen_lemmas_per_word[start_char] = True
+
         occurrence_num = lemma_occurrence_counter[lemma]
         total_reps = lemma_total_counter[lemma]
+
+
+
 
         # Extract top-k image attentions and sums
         topk_image_indices = np.zeros((num_layers, num_heads, TOPK), dtype=np.int64)
@@ -177,7 +249,7 @@ def sentence_data_extraction(
                 topk_image_values_next[layer_idx]  = vals_nxt.cpu().numpy()
 
         # Select logits
-        logit = sort_select(candidate_logits[idx])
+        logit = sort_select(candidate_logits[idx].squeeze())
 
         all_occurrence_indices = lemma_to_indices[lemma].copy() if occurrence_num == 1 and total_reps > 1 else []
 
@@ -185,7 +257,7 @@ def sentence_data_extraction(
         sample_dict = {
             "sentence_idx": image_id,
             "caption": gen_text,
-            "token_idx": idx,
+            "token_idx": idx+token_offset,
             "topk_attn": topk_image_values.copy(),
             "topk_attn_next": topk_image_values_next.copy(),
             "logits": logit,
@@ -198,7 +270,7 @@ def sentence_data_extraction(
             "all_occurrence_indices": all_occurrence_indices,
         }
         
-        if mscoco_objects:
+        if mscoco_objects is not None:
             sample_dict["is_ms_object"] = lemma in mscoco_objects
 
         samples_4_classification.append(sample_dict)
