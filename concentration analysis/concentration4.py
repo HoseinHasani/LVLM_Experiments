@@ -7,7 +7,7 @@ from tqdm import tqdm
 import seaborn as sns
 
 # ---------------- CONFIG ----------------
-data_dir = "data/all layers all attention tp fp"
+data_dir = "data/all layers all attention tp fp rep plus"
 files = glob(os.path.join(data_dir, "attentions_*.pkl"))
 n_layers, n_heads = 32, 32           # as in your model
 n_img_side = 24                      # 24x24 = 576 visual tokens
@@ -23,6 +23,13 @@ def extract_topk_positions(data_dict, cls_, top_k):
     for e in entries:
         if not e.get("subtoken_results"):
             continue
+        rep_num = e['rep_num']
+        
+        
+        if rep_num != 1:
+            if rep_num is not None:
+                continue
+            
         for sub in e["subtoken_results"]:
             topk_inds = np.array(sub["topk_indices"], dtype=int)
             if topk_inds.ndim != 3:
@@ -104,7 +111,7 @@ def plot_variance_over_tokens(tp_variances, fp_variances, oth_variances, save_di
     plt.ylabel("Variance of Attended Positions", fontsize=12)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"variance_over_tokens.png"), dpi=150)
+    plt.savefig(os.path.join(save_dir, f"variance_over_tokens_rep_plus.png"), dpi=150)
     plt.close()
 
 # ---------------- STEP 5: Run everything ----------------
