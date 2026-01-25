@@ -39,7 +39,11 @@ score_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/Ensemble/exp
 priors_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/final_cl_results/priors"
 base_save_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/final_cl_results"
 
+attn_dir = "../../data/all layers all attention tp fp rep double r"
+score_dir = "../../data/double_scores r"
 
+priors_dir = "priors_r"
+base_save_dir = "final_cl_results_r"
 
 os.makedirs(base_save_dir, exist_ok=True)
 os.makedirs(priors_dir, exist_ok=True)
@@ -238,68 +242,92 @@ def extract_all_features(attn_file_dict, score_file_dict, file_ids, n_layers, n_
     return np.array(X), np.array(y), np.array(pos_list), np.array(cls_list), np.array(lemma_list, dtype=object), np.array(all_occ_ind_list, dtype=object), rep_list
 
 
-def compute_adaptive_fp_replication_factors(y_all, pos_all, win=5):
-    """Compute adaptive FP replication factor per token position."""
-    min_pos, max_pos = int(pos_all.min()), int(pos_all.max())
-    replication_factors = {}
-    pos_to_labels = defaultdict(list)
+def upsample_to_target(indices, target_size, rng):
+    """
+    Upsample a set of indices to exactly target_size using:
+    - zero or one full repetition
+    - remaining samples without replacement
+    """
+    n = len(indices)
+    if n == 0:
+        return []
 
-    for pos, label in zip(pos_all, y_all):
-        pos_to_labels[int(pos)].append(int(label))
+    if n >= target_size:
+        return rng.choice(indices, size=target_size, replace=False).tolist()
 
-    for j in range(min_pos, max_pos + 1):
-        local_labels = []
-        for k in range(j - win, j + win + 1):
-            if k in pos_to_labels:
-                local_labels.extend(pos_to_labels[k])
+    # At most one full repetition
+    reps = target_size // n
+    reps = min(reps, 1)
 
-        if len(local_labels) == 0:
-            replication_factors[j] = 1
+    out = indices * reps
+    remaining = target_size - len(out)
+
+    pool = indices.copy()
+    if remaining > len(pool):
+        # one extra repetition allowed, still capped
+        pool = pool + indices
+
+    out += rng.choice(pool, size=remaining, replace=False).tolist()
+    return out
+
+
+
+def balance_samples_by_position(
+    X, y, pos, cls, lmm, occ, reps,
+    classes=("fp", "tp"),
+    random_state=0,
+):
+    """
+    Balance samples per token position.
+    
+    Parameters
+    ----------
+    classes : tuple
+        ("fp", "tp") or ("fp", "tp", "other")
+    """
+    rng = np.random.default_rng(random_state)
+
+    X_out, y_out, pos_out, cls_out, lmm_out, occ_out, reps_out = [], [], [], [], [], [], []
+
+    unique_positions = np.unique(pos)
+
+    for p in unique_positions:
+        mask_p = (pos == p)
+
+        # collect indices per class
+        class_to_indices = {}
+        for c in classes:
+            class_to_indices[c] = np.where(mask_p & (cls == c))[0].tolist()
+
+        # target size = max class count at this position
+        target = max(len(v) for v in class_to_indices.values())
+        if target == 0:
             continue
 
-        n_0 = np.sum(np.array(local_labels) == 0)
-        n_1 = np.sum(np.array(local_labels) == 1)
-        if n_0 == 0:
-            replication_factors[j] = 20
-        else:
-            replication_factors[j] = max(int(fp2tp_ratio * np.round(n_1 / n_0)), 1)
+        for c, idxs in class_to_indices.items():
+            balanced_idxs = upsample_to_target(idxs, target, rng)
 
-    print(f"Computed adaptive replication factors for positions {min_pos}–{max_pos}")
-    return replication_factors
+            X_out.append(X[balanced_idxs])
+            y_out.append(y[balanced_idxs])
+            pos_out.append(pos[balanced_idxs])
+            cls_out.append(cls[balanced_idxs])
+            lmm_out.append(lmm[balanced_idxs])
+            occ_out.append(occ[balanced_idxs])
+            reps_out.append(reps[balanced_idxs])
+
+    return (
+        np.concatenate(X_out, axis=0),
+        np.concatenate(y_out, axis=0),
+        np.concatenate(pos_out, axis=0),
+        np.concatenate(cls_out, axis=0),
+        np.concatenate(lmm_out, axis=0),
+        np.concatenate(occ_out, axis=0),
+        np.concatenate(reps_out, axis=0),
+    )
 
 
-def balance_fp_samples_adaptive(X, y, pos, cls, lmm, occ, reps, fp_factors):
-    """Replicate FP samples based on adaptive per-position factors."""
-    X_bal, y_bal, pos_bal, cls_bal, lmm_bal, occ_bal, reps_bal = [X], [y], [pos], [cls], [lmm], [occ], [reps]
 
-    for p, factor in fp_factors.items():
-        mask = (y == 0) & (pos == p)
-        if np.any(mask) and factor > 1:
-            factor = min(factor, 30)
-            X_rep = np.repeat(X[mask], factor, axis=0)
-            y_rep = np.repeat(y[mask], factor, axis=0)
-            pos_rep = np.repeat(pos[mask], factor, axis=0)
-            cls_rep = np.repeat(cls[mask], factor, axis=0)
-            lmm_rep = np.repeat(lmm[mask], factor, axis=0)
-            occ_rep = np.repeat(occ[mask], factor, axis=0)
-            reps_rep = np.repeat(reps[mask], factor, axis=0)
-            X_bal.append(X_rep)
-            y_bal.append(y_rep)
-            pos_bal.append(pos_rep)
-            cls_bal.append(cls_rep)
-            lmm_bal.append(lmm_rep)
-            occ_bal.append(occ_rep)
-            reps_bal.append(reps_rep)
 
-    X_bal = np.concatenate(X_bal, axis=0)
-    y_bal = np.concatenate(y_bal, axis=0)
-    pos_bal = np.concatenate(pos_bal, axis=0)
-    cls_bal = np.concatenate(cls_bal, axis=0)
-    lmm_bal = np.concatenate(lmm_bal, axis=0)
-    occ_bal = np.concatenate(occ_bal, axis=0)
-    reps_bal = np.concatenate(reps_bal, axis=0)
-
-    return X_bal, y_bal, pos_bal, cls_bal, lmm_bal, occ_bal, reps_bal
 
 def drop_samples(X, y, pos, cls, lmm, occ, reps,target="other", dropout_ratio=0.5):
     """
@@ -400,7 +428,8 @@ if tp_dropout > 0:
     X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all, reps_all = drop_samples(
         X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all, reps_all, target="tp", dropout_ratio=other_dropout
     )
-    
+
+
 reps_org = reps_all.copy()
 
 # -----------------------------
@@ -427,19 +456,22 @@ y_train_original = y_all #y_train.copy()
 # -----------------------------
 # Apply Adaptive FP Balancing
 # -----------------------------
-train_fp_factors = compute_adaptive_fp_replication_factors(y_all, pos_train, win=5)
-test_fp_factors = train_fp_factors #compute_adaptive_fp_replication_factors(y_test, pos_test, win=5)
-
 
 if balanced_train:
-    X_train, y_train, pos_train, cls_train, lemma_train, all_occ_train, reps_train = balance_fp_samples_adaptive(
-        X_train, y_train, pos_train, cls_train, lemma_train, all_occ_train, reps_train, train_fp_factors
-    )
+    X_train, y_train, pos_train, cls_train, lemma_train, occ_train, reps_train = \
+        balance_samples_by_position(
+            X_train, y_train, pos_train, cls_train,
+            lemma_train, all_occ_train, reps_train,
+            classes=("fp", "tp")
+        )
 
 if balanced_test:
-    X_test, y_test, pos_test, cls_test, lemma_test, all_occ_test, reps_test = balance_fp_samples_adaptive(
-        X_test, y_test, pos_test, cls_test, lemma_test, all_occ_test, reps_test , test_fp_factors
-    )
+    X_test, y_test, pos_test, cls_test, lemma_test, occ_test, reps_test = \
+        balance_samples_by_position(
+            X_test, y_test, pos_test, cls_test,
+            lemma_test, all_occ_test, reps_test,
+            classes=("fp", "tp")
+        )
 
 
 
@@ -610,7 +642,7 @@ prior_loader = DataLoader(
 
 prior_net.train()
 
-for epoch in range(7): # hard code for now
+for epoch in range(10): # hard code for now
     epoch_loss = 0.0
     n_samples = 0
 
