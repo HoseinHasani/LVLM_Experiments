@@ -47,6 +47,11 @@ def halluscope_score(preds, alpha=0.5, beta=0.3):
     for p in preds:
         if not p.get("is_first_occ", False):
             continue
+        
+        if "is_ms_object" in p.keys():
+            if not p["is_ms_object"]:
+                print(".")
+                continue
 
         pred = p.get("final_pred", None)
         if pred is None:
@@ -63,6 +68,7 @@ def halluscope_score(preds, alpha=0.5, beta=0.3):
     return score
 
 
+
 def sentence_evaluator(
     candidate_attentions,
     candidate_logits,
@@ -74,15 +80,20 @@ def sentence_evaluator(
     image_start_idx=35,
     image_length=576,
     topk=20,
+    ms_coco_obj=None,
+    skip_end=True
 ):
+    
     
     samples_4_classification = sentence_data_extraction(candidate_attentions,
                                                         candidate_logits,
-                                                        halluscope,
-                                                        token_offset,
                                                         tokenizer,
                                                         fast_tokenizer,
-                                                        output_ids)
+                                                        output_ids,
+                                                        token_offset,
+                                                        mscoco_objects=ms_coco_obj,
+                                                        skip_end=skip_end
+                                                        )
 
     preds = halluscope.predict(samples_4_classification)
     score = halluscope_score(preds)
@@ -133,7 +144,7 @@ def sample_with_ensemble(
     self,
     input_ids: torch.LongTensor,
     ensemble_size: int = 10,
-    pseudo_sentence_length: int = 20,
+    pseudo_sentence_length: int = 10,
     search_start: int = 2,
     logits_processor: Optional[LogitsProcessorList] = None,
     stopping_criteria: Optional[StoppingCriteriaList] = None,
@@ -152,6 +163,9 @@ def sample_with_ensemble(
     """
     Ensemble-guided sampling with diversity encouragement and optional NLTK POS tagging.
     """
+    mscoco_objects= np.load("/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/Ensemble/experiments/eval_new/mscoco_objects.npy")
+
+    # mscoco_objects = None
     classifier = getattr(self, "classifier", None)
     tokenizer = getattr(self, "tokenizer", None)
     fast_tokenizer = getattr(self, "fast_tokenizer", None)
@@ -180,6 +194,8 @@ def sample_with_ensemble(
     model_kwargs_main = model_kwargs.copy()
     finished = False
     total_generated = 0
+    ensemble_iter = 0
+    prompt_len = input_ids.shape[1]
 
     # ---------- Phase 1: Warm-up ----------
     while total_generated < search_start and not finished:
@@ -203,6 +219,17 @@ def sample_with_ensemble(
             streamer.put(next_tokens.cpu())
 
     while not finished:
+        
+        ensemble_iter += 1
+
+        if ensemble_iter == 1:
+            current_pseudo_length = 3 * pseudo_sentence_length
+        elif ensemble_iter == 2:
+            current_pseudo_length = 1 * pseudo_sentence_length
+        else:
+            current_pseudo_length = pseudo_sentence_length
+
+
         candidate_outputs, candidate_attentions, candidate_logits, candidate_scores, candidate_model_kwargs = [], [], [], [], []
 
         for candidate_idx in range(ensemble_size):
@@ -210,7 +237,7 @@ def sample_with_ensemble(
             input_tmp = final_input_ids.clone()
             decoder_attn_tmp, decoder_lgt_tmp, token_count, eos_hit = [], [], 0, False
 
-            while token_count < pseudo_sentence_length and not eos_hit:
+            while token_count < current_pseudo_length+1 and not eos_hit:
                 model_inputs = self.prepare_inputs_for_generation(input_tmp, **model_kwargs_tmp)
                 outputs = self(**model_inputs, return_dict=True, output_attentions=True)
 
@@ -227,9 +254,10 @@ def sample_with_ensemble(
                 decoder_attn_tmp.append(
                     outputs.cross_attentions if self.config.is_encoder_decoder else outputs.attentions
                 )
-                model_kwargs_tmp = self._update_model_kwargs_for_generation(
-                    outputs, model_kwargs_tmp, is_encoder_decoder=self.config.is_encoder_decoder
-                )
+                if token_count < current_pseudo_length:
+                    model_kwargs_tmp = self._update_model_kwargs_for_generation(
+                        outputs, model_kwargs_tmp, is_encoder_decoder=self.config.is_encoder_decoder
+                    )
 
                 token_count += 1
                 if next_tokens[0].item() in eos_token_id:
@@ -250,21 +278,33 @@ def sample_with_ensemble(
         for i in range(len(candidate_outputs)):
             candidate_scores.append(
                 sentence_evaluator(candidate_attentions[i], candidate_logits[i], classifier, total_generated,
-                                   tokenizer, fast_tokenizer, candidate_outputs[i])
+                                   tokenizer, fast_tokenizer, candidate_outputs[i][:,prompt_len:],ms_coco_obj=mscoco_objects, 
+                                   skip_end=len(candidate_attentions)==(current_pseudo_length+1))
             )
 
-        total_generated += pseudo_sentence_length
-        best_idx = int(torch.tensor(candidate_scores).argmax())
 
+        best_idx = int(torch.tensor(candidate_scores).argmax())
+        total_generated += min(current_pseudo_length, len(candidate_attentions[best_idx]))
+
+        
         final_input_ids = candidate_outputs[best_idx]
+        eos_cond = any(t.item() in eos_token_id for t in final_input_ids[0])
+
+        if not eos_cond:
+            final_input_ids = final_input_ids[:,:-1]
+
         model_kwargs_main = _detach_and_clone_model_kwargs(
             candidate_model_kwargs[best_idx], device=next(self.parameters()).device
         )
 
         _assert_cache_alignment(model_kwargs_main, final_input_ids)
+        
+        best_tokens = candidate_outputs[best_idx][:, -current_pseudo_length:]
 
-        best_tokens = candidate_outputs[best_idx][:, -pseudo_sentence_length:]
-        if any(t.item() in eos_token_id for t in best_tokens[0]) or stopping_criteria(final_input_ids, None):
+        if not eos_cond:
+            best_tokens = best_tokens[:,:-1]
+
+        if eos_cond or stopping_criteria(final_input_ids, None):
             finished = True
 
         if streamer is not None:
