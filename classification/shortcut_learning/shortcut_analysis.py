@@ -23,6 +23,24 @@ score_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/Ensemble/exp
 priors_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/minigpt_temp05_final_joint_cl_results/priors"
 base_save_dir = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/rz15dire/LVLM_Experiments/classification/minigpt_temp05_final_joint_cl_results"
 
+attn_dir = "../../data/all layers all attention tp fp rep double r"
+score_dir = "../../data/double_scores r"
+priors_dir = "priors_r"
+base_save_dir = "final_cl_results_short"
+
+
+
+#########################
+
+enable_shortcut_eval = True
+
+shortcut_strategy = "position"
+
+shortcut_n_per_class = 200
+shortcut_n_per_group = 100 
+
+fp_pos_range = (5, 20) 
+tp_pos_range = (110, 130) 
 
 
 #######################
@@ -356,6 +374,125 @@ def drop_samples(X, y, pos, cls, lmm, occ, reps,target="other", dropout_ratio=0.
 
 
 
+
+
+
+# ============================================================
+# Shortcut Analysis: Test-Time Minority Sampling Utilities
+# ============================================================
+
+def _sample_indices(indices, n_samples, rng):
+    if len(indices) == 0:
+        return np.array([], dtype=int)
+    n = min(n_samples, len(indices))
+    return rng.choice(indices, size=n, replace=False)
+
+
+def sample_test_by_class(
+    y,
+    n_per_class,
+    random_state=0,
+):
+    """
+    Class-balanced random sampling.
+    """
+    rng = np.random.default_rng(random_state)
+
+    idx_fp = np.where(y == 0)[0]
+    idx_tp = np.where(y == 1)[0]
+
+    sel_fp = _sample_indices(idx_fp, n_per_class, rng)
+    sel_tp = _sample_indices(idx_tp, n_per_class, rng)
+
+    selected = np.concatenate([sel_fp, sel_tp])
+    rng.shuffle(selected)
+
+    return selected
+
+
+def sample_test_by_position(
+    y,
+    pos,
+    fp_pos_range,
+    tp_pos_range,
+    n_per_group,
+    random_state=0,
+):
+    """
+    Position-based minority sampling.
+    FP: early positions
+    TP: late positions
+    """
+    rng = np.random.default_rng(random_state)
+
+    fp_mask = (
+        (y == 0)
+        & (pos >= fp_pos_range[0])
+        & (pos <= fp_pos_range[1])
+    )
+    tp_mask = (
+        (y == 1)
+        & (pos >= tp_pos_range[0])
+        & (pos <= tp_pos_range[1])
+    )
+
+    fp_indices = np.where(fp_mask)[0]
+    tp_indices = np.where(tp_mask)[0]
+
+    sel_fp = _sample_indices(fp_indices, n_per_group, rng)
+    sel_tp = _sample_indices(tp_indices, n_per_group, rng)
+
+    selected = np.concatenate([sel_fp, sel_tp])
+    rng.shuffle(selected)
+
+    return selected
+
+
+def build_shortcut_test_split(
+    X, y, pos, cls, lemma, occ, reps,
+    strategy,
+    random_state,
+    n_per_class,
+    n_per_group,
+    fp_pos_range,
+    tp_pos_range,
+):
+    """
+    Returns shortcut-evaluation test split with SAME variable structure.
+    """
+    if strategy == "class":
+        idx = sample_test_by_class(
+            y,
+            n_per_class=n_per_class,
+            random_state=random_state,
+        )
+
+    elif strategy == "position":
+        idx = sample_test_by_position(
+            y,
+            pos,
+            fp_pos_range=fp_pos_range,
+            tp_pos_range=tp_pos_range,
+            n_per_group=n_per_group,
+            random_state=random_state,
+        )
+
+    else:
+        raise ValueError(f"Unknown shortcut strategy: {strategy}")
+
+    return (
+        X[idx],
+        y[idx],
+        pos[idx],
+        cls[idx],
+        lemma[idx],
+        occ[idx],
+        reps[idx],
+    )
+
+
+
+
 # -----------------------------
 # Load or Extract Dataset
 # -----------------------------
@@ -437,6 +574,11 @@ if tp_dropout > 0:
         X_all, y_all, pos_all, cls_all, lemma_all, all_occ_list_all, reps_all, target="tp", dropout_ratio=other_dropout
     )
     
+
+
+
+
+    
 reps_org = reps_all.copy()
 
 # -----------------------------
@@ -482,119 +624,40 @@ if balanced_test:
         )
 
 
-
-
+    
+if enable_shortcut_eval:
+    X_test, y_test, pos_test, cls_test, lemma_test, occ_test, reps_test = \
+        build_shortcut_test_split(
+            X=X_test,
+            y=y_test,
+            pos=pos_test,
+            cls=cls_test,
+            lemma=lemma_test,
+            occ=occ_test,
+            reps=reps_test,
+            strategy=shortcut_strategy,
+            random_state=42,
+            n_per_class=shortcut_n_per_class,
+            n_per_group=shortcut_n_per_group,
+            fp_pos_range=fp_pos_range,
+            tp_pos_range=tp_pos_range,
+        )
+        
+    print(
+        f"[Shortcut Eval] strategy={shortcut_strategy} | "
+        f"size={len(y_test)} | "
+        f"TP={np.sum(y_test==1)} | FP={np.sum(y_test==0)}"
+    )
+    
+    
 print(f"Train size: {len(y_train)} | TP={np.sum(y_train==1)}, FP={np.sum(y_train==0)}")
 print(f"Test size:  {len(y_test)} | TP={np.sum(y_test==1)}, FP={np.sum(y_test==0)}")
 
 
-# -----------------------------
-# Build position-dependent priors
-# -----------------------------
 
-def fill_nans_linear(x):
-    x = x.astype(float)
-    n = len(x)
-    idx = np.arange(n)
-
-    valid = ~np.isnan(x)
-    if valid.sum() == 0:
-        return x  
-
-    x_filled = x.copy()
-    x_filled[~valid] = np.interp(
-        idx[~valid],
-        idx[valid],
-        x[valid]
-    )
-    return x_filled
-
-
-# Use ORIGINAL (unbalanced) data
-pos_orig = pos_all          # token positions
-labels_orig = y_all         # 0 = FP, 1 = TP
-
-positions = np.arange(min_position, max_position + 1)
-n_pos = len(positions)
-
-# counts[t, y]
-counts = np.zeros((n_pos, 2), dtype=np.float32)
-
-for i, t in enumerate(positions):
-    mask = (pos_orig == t)
-    if mask.any():
-        counts[i, 0] = np.sum(labels_orig[mask] == 0)
-        counts[i, 1] = np.sum(labels_orig[mask] == 1)
-    else:
-        counts[i, :] = np.nan
-
-# Convert counts → priors
-priors_tokenposition = np.full((n_pos, 2), np.nan, dtype=np.float32)
-
-total = counts.sum(axis=1)
-
-valid = total > 0
-priors_tokenposition[valid, 0] = counts[valid, 0] / total[valid]
-priors_tokenposition[valid, 1] = counts[valid, 1] / total[valid]
-
-# Fill missing positions using nearest non-NaN
-priors_tokenposition[:, 0] = fill_nans_linear(priors_tokenposition[:, 0])
-priors_tokenposition[:, 1] = fill_nans_linear(priors_tokenposition[:, 1])
-
-# Numerical safety
-eps = 1e-7
-priors_tokenposition = np.clip(priors_tokenposition, eps, 1 - eps)
-priors_tokenposition /= priors_tokenposition.sum(axis=1, keepdims=True)
-
-# Torch tensor
-priors_t = torch.tensor(
-    priors_tokenposition,
-    dtype=torch.float32
-).to(device)
-
-# Save
-np.save(
-    os.path.join(priors_dir, "priors_token_position.npy"),
-    priors_tokenposition
-)
-
-
-######## repition prior ##########
-rep_vals = reps_org.astype(int) - 1
-labels   = y_train_original
-
-
-n_bins = 4
-eps = 1e-6
-
-# counts[r, y]
-counts = np.zeros((n_bins, 2), dtype=np.float32)
-
-for r in range(n_bins):
-    for y in [0, 1]:
-        counts[r, y] = np.sum((rep_vals == r) & (labels == y))
-
-# add smoothing
-counts += eps
-
-# COLUMN-WISE normalization
-priors_r = counts / counts.sum(axis=0, keepdims=True)
-
-priors_r = torch.tensor(priors_r, dtype=torch.float32).to(device)
-
-
-np.save(
-    os.path.join(priors_dir, "priors_repetition.npy"),
-    priors_r.cpu().numpy()
-)
-
-
-
-
-
-# ============================================================
+# ========================================================
 # Learn joint prior p(y | r, t) using a small MLP
-# ============================================================
+# ========================================================
 
 class PriorRTNet(nn.Module):
     def __init__(self, hidden=32):
@@ -611,9 +674,9 @@ class PriorRTNet(nn.Module):
 
 
 
-# ------------------------------------------------------------
+# --------------------------------------------------------
 # Prepare prior training data (USE ORIGINAL DATA, NO BALANCING)
-# ------------------------------------------------------------
+# --------------------------------------------------------
 
 # Decode repetition (0..3) and position (min_position..max_position)
 rep_vals = (reps_org.astype(np.int64) - 1)
@@ -678,7 +741,6 @@ for p in prior_net.parameters():
 
 torch.save(prior_net.state_dict(), os.path.join(priors_dir, "prior_rt_mlp.pt"))
 print("Joint prior network trained and saved.")
-
 
 
 
@@ -976,184 +1038,5 @@ np.save(f"{results_dir}/pos_test_{target_rep}.npy", pos_test2)
 np.save(f"{results_dir}/lemma_test_{target_rep}.npy", lemma_test2)        
         
 
-
-
-
-
-
-# ============================================================
-# Evaluate and marginalize learned joint prior p(y | r, t)
-# ============================================================
-
-import matplotlib.pyplot as plt
-
-prior_net.eval()
-
-# Original (unbalanced) data
-rep_vals = (reps_org.astype(np.int64) - 1)     # 0..3
-pos_vals = pos_all.astype(np.int64)            # min_position..max_position
-
-# Normalize for prior network
-rep_norm = rep_vals / 3.0
-pos_norm = (pos_vals - min_position) / (max_position - min_position)
-
-X_rt = torch.tensor(
-    np.stack([rep_norm, pos_norm], axis=1),
-    dtype=torch.float32
-).to(device)
-
-with torch.no_grad():
-    prior_logits = prior_net(X_rt)
-    prior_probs = torch.softmax(prior_logits, dim=1).cpu().numpy()
-    
-
-# ============================================================
-# p(y | r)
-# ============================================================
-
-p_y_given_r = np.zeros((4, 2), dtype=np.float64)
-
-for r in range(4):
-    mask = rep_vals == r
-    assert mask.sum() > 0, f"No samples for repetition r={r}"
-    p_y_given_r[r] = prior_probs[mask].mean(axis=0)
-
-
-
-# ============================================================
-# p(y | t)
-# ============================================================
-
-positions = np.arange(min_position, max_position + 1)
-p_y_given_t = np.zeros((len(positions), 2), dtype=np.float64)
-
-for i, t in enumerate(positions):
-    mask = pos_vals == t
-    # assert mask.sum() > 0, f"No samples for position t={t}"
-    if mask.sum() < 1:
-        continue
-    p_y_given_t[i] = prior_probs[mask].mean(axis=0)
-
-
-
-
-
-priors_r_tab = priors_r.cpu().numpy()          # shape (4, 2)
-priors_t_tab = priors_t.cpu().numpy()            # shape (151, 2)
-
-
-
-
-# ============================================================
-# Plot p(y | r) for both classes
-# ============================================================
-
-p_y_given_r = p_y_given_r / p_y_given_r.sum(0)
-
-r_vals = np.arange(1, 5)
-width = 0.35
-
-for y in [0, 1]:
-    plt.figure(figsize=(6, 4))
-
-    plt.bar(
-        r_vals - width / 2,
-        priors_r_tab[:, y],
-        width=width,
-        label=f"Tabular (y={y})",
-        alpha=0.8
-    )
-    plt.bar(
-        r_vals + width / 2,
-        p_y_given_r[:, y],
-        width=width,
-        label=f"Learned (y={y})",
-        alpha=0.8
-    )
-
-    plt.xlabel("Repetition (r)")
-    plt.ylabel(f"p(y={y} | r)")
-    plt.title(f"Repetition prior comparison (class {y})")
-    plt.legend()
-    plt.tight_layout()
-
-    save_path = os.path.join(priors_dir, f"prior_r_class_{y}.png")
-    plt.savefig(save_path)
-    plt.close()
-
-
-
-# ============================================================
-# Plot p(y | t) for both classes
-# ============================================================
-
-for y in [0, 1]:
-    plt.figure(figsize=(10, 4))
-
-    plt.plot(
-        positions,
-        priors_t_tab[:, y],
-        label=f"Tabular (y={y})",
-        linewidth=2
-    )
-    plt.plot(
-        positions,
-        p_y_given_t[:, y],
-        label=f"Learned (y={y})",
-        linewidth=2,
-        linestyle="--"
-    )
-
-    plt.xlabel("Token position (t)")
-    plt.ylabel(f"p(y={y} | t)")
-    plt.title(f"Token-position prior comparison (class {y})")
-    plt.legend()
-    plt.tight_layout()
-
-    save_path = os.path.join(priors_dir, f"prior_t_class_{y}.png")
-    plt.savefig(save_path)
-    plt.close()
-
-
-
-
-
-# ============================================================
-# Difference plots (Learned − Tabular)
-# ============================================================
-
-# Repetition
-for y in [0, 1]:
-    plt.figure(figsize=(6, 3))
-    plt.bar(
-        r_vals,
-        p_y_given_r[:, y] - priors_r_tab[:, y]
-    )
-    plt.axhline(0, color="black", linewidth=1)
-    plt.xlabel("Repetition (r)")
-    plt.ylabel(f"Δ p(y={y} | r)")
-    plt.title(f"Difference in repetition prior (class {y})")
-    plt.tight_layout()
-
-    save_path = os.path.join(priors_dir, f"diff_prior_r_class_{y}.png")
-    plt.savefig(save_path)
-    plt.close()
-
-# Position
-for y in [0, 1]:
-    plt.figure(figsize=(10, 3))
-    plt.plot(
-        positions,
-        p_y_given_t[:, y] - priors_t_tab[:, y]
-    )
-    plt.axhline(0, color="black", linewidth=1)
-    plt.xlabel("Token position (t)")
-    plt.ylabel(f"Δ p(y={y} | t)")
-    plt.title(f"Difference in token-position prior (class {y})")
-    plt.tight_layout()
-
-    save_path = os.path.join(priors_dir, f"diff_prior_t_class_{y}.png")
-    plt.savefig(save_path)
-    plt.close()
 
 
