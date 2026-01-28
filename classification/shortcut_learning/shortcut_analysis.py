@@ -32,9 +32,11 @@ base_save_dir = "final_cl_results_short"
 
 #########################
 
+
+balanced_train = True
 enable_shortcut_eval = True
 
-shortcut_strategy = "position"
+shortcut_strategy = "position" # class or position
 
 shortcut_n_per_class = 200
 shortcut_n_per_group = 100 
@@ -42,9 +44,13 @@ shortcut_n_per_group = 100
 fp_pos_range = (5, 20) 
 tp_pos_range = (110, 130) 
 
+load_from_existing = True
+
+
+exp_name = f"exp_shortcut__strategy_{shortcut_strategy}__balanced_{balanced_train}"
 
 #######################
-load_from_existing = True
+
 target_rep = 1
 
 target_class = 'tp'
@@ -85,14 +91,15 @@ eps = 1e-10
 use_entropy = True
 n_epochs = 2
 weight_decay = 1e-3
-dropout_rate = 0.5
+
+if balanced_train:
+    dropout_rate = 0.5
+else:
+    dropout_rate = 0.001
+    
 normalize_features = True
 
-sfx = ""
-sfx = sfx if use_logits else sfx + "_no_logits"
-sfx = sfx if use_attns else sfx + "_no_attns"
 
-exp_name = f"exp__bayes_ce{sfx}"
 save_dir = os.path.join(base_save_dir, exp_name)
 model_dir = os.path.join(save_dir, "model")
 results_dir = os.path.join(save_dir, "results")
@@ -633,7 +640,7 @@ if enable_shortcut_eval:
             pos=pos_test,
             cls=cls_test,
             lemma=lemma_test,
-            occ=occ_test,
+            occ=all_occ_test,
             reps=reps_test,
             strategy=shortcut_strategy,
             random_state=42,
@@ -669,6 +676,7 @@ class PriorRTNet(nn.Module):
         )
 
     def forward(self, x):
+        x[:, 0] = 0. #block the repetition
         return self.net(x)
 
 
@@ -841,6 +849,7 @@ class BayesianMLPClassifier(nn.Module):
         return rep_real
 
     def forward(self, x, return_bayesian=True):
+        x[:, 0] = 0. #block the repetition
         raw_logits = self.net(x)
         raw_posteriors = torch.softmax(raw_logits, dim=1)
 
@@ -870,7 +879,10 @@ class BayesianMLPClassifier(nn.Module):
         # ----------------------------------
         # Bayesian correction
         # ----------------------------------
-        bayes_unnormalized = raw_posteriors * priors_rt
+        if balanced_train:
+            bayes_unnormalized = raw_posteriors * priors_rt
+        else:
+            bayes_unnormalized = raw_posteriors
         # * priors_rt
         # 
         bayes_posteriors = bayes_unnormalized / (
@@ -1003,40 +1015,95 @@ y_pred  = np.array(y_pred)
 y_true  = np.array(y_true)
 
 
-np.save(f"{results_dir}/y_probs_{target_rep}.npy", y_probs)
-np.save(f"{results_dir}/y_pred_{target_rep}.npy", y_pred)
-np.save(f"{results_dir}/y_true_{target_rep}.npy", y_true)
-np.save(f"{results_dir}/cls_test_{target_rep}.npy", cls_test)
-np.save(f"{results_dir}/pos_test_{target_rep}.npy", pos_test)
-np.save(f"{results_dir}/lemma_test_{target_rep}.npy", lemma_test)
 
 
-y_probs2 = []
-y_pred2 = []
-y_true2 = []
-cls_test2 = []
-pos_test2 = []
-lemma_test2 = []
-
-for i, r in enumerate(reps_test):
-    if r < 2:
-        continue
-    for k in range(r-1):
-        y_probs2.append(y_probs[i])
-        y_pred2.append(y_pred[i])
-        y_true2.append(y_true[i])
-        cls_test2.append(cls_test[i])
-        pos_test2.append(pos_test[i])
-        lemma_test2.append(lemma_test[i])
-        
-target_rep = 2
-np.save(f"{results_dir}/y_probs_{target_rep}.npy", y_probs2)
-np.save(f"{results_dir}/y_pred_{target_rep}.npy", y_pred2)
-np.save(f"{results_dir}/y_true_{target_rep}.npy", y_true2)
-np.save(f"{results_dir}/cls_test_{target_rep}.npy", cls_test2)
-np.save(f"{results_dir}/pos_test_{target_rep}.npy", pos_test2)
-np.save(f"{results_dir}/lemma_test_{target_rep}.npy", lemma_test2)        
-        
 
 
+
+# ============================================================
+# Per-Class (Group) Metrics
+# ============================================================
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_recall_fscore_support,
+    roc_curve,
+    auc,
+    precision_recall_curve,
+    average_precision_score,
+)
+
+def compute_per_class_metrics(
+    y_true,
+    y_pred,
+    y_probs,
+    cls_test,
+    results_dir,
+):
+    """
+    Reports Acc / Precision / Recall / F1 / AUROC / AUPR per class group.
+    Groups are defined by cls_test (e.g., FP / TP / Other).
+    """
+
+    classes = np.unique(cls_test)
+    lines = []
+
+    print("\n[Per-Class Metrics]")
+
+    for cls in classes:
+        mask = np.array(cls_test) == cls
+        if mask.sum() == 0:
+            continue
+
+        yt = y_true[mask]
+        yp = y_pred[mask]
+        yprob = y_probs[mask]
+
+        # Basic metrics
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            yt, yp, average='binary', zero_division=0
+        )
+        acc = accuracy_score(yt, yp)
+
+        # ROC / PR (guard against single-class edge case)
+        if len(np.unique(yt)) > 1:
+            fpr, tpr, _ = roc_curve(yt, yprob)
+            roc_auc = auc(fpr, tpr)
+
+            precision_curve, recall_curve, _ = precision_recall_curve(yt, yprob)
+            ap_score = average_precision_score(yt, yprob)
+        else:
+            roc_auc = float("nan")
+            ap_score = float("nan")
+
+        line = (
+            f"{cls}: "
+            f"Acc={acc:.3f} | "
+            f"Pr={precision:.3f} | "
+            f"Rec={recall:.3f} | "
+            f"F1={f1:.3f} | "
+            f"AUPR={ap_score:.3f} | "
+            f"AUROC={roc_auc:.3f} "
+            f"(n={mask.sum()})"
+        )
+
+        print(line)
+        lines.append(line)
+
+    # Save to file
+    out_file = os.path.join(results_dir, "per_class_metrics.txt")
+    with open(out_file, "w") as f:
+        f.write("\n".join(lines))
+
+
+
+
+
+compute_per_class_metrics(
+    y_true=y_true,
+    y_pred=y_pred,
+    y_probs=y_probs,
+    cls_test=cls_test,
+    results_dir=results_dir,
+)
 
