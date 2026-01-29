@@ -9,31 +9,38 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from collections import defaultdict
+from eval_module import evaluate
 
 
-
-# -----------------------------
-# Configuration
-# -----------------------------
 
 
 #######################
-load_from_existing = True
-target_rep = 1
+
+attn = True
+logit = True
+
+first = True
+poscond = True
+repcond = True
 
 balanced_train = True
 balanced_test = False
-fp2tp_ratio = 1.0
 
-train_size = 0.5
-test_size = 0.5
-pos_condition = True
-use_logits = True
-use_attns = True
+seed = 0
 #######################
 
+
+
+target_rep = 1
+train_size = 0.5
+test_size = 0.5
+
+
 base_save_dir = "ablation/"
-dataset_path = "../data/"
+if first:
+    dataset_path = "../data/1"
+else:
+    dataset_path = "../data"    
 
 os.makedirs(base_save_dir, exist_ok=True)
 
@@ -52,11 +59,8 @@ weight_decay = 1e-3
 dropout_rate = 0.5
 normalize_features = True
 
-sfx = ""
-sfx = sfx if use_logits else sfx + "_no_logits"
-sfx = sfx if use_attns else sfx + "_no_attns"
 
-exp_name = f"exp__bayes_ce{sfx}"
+exp_name = f"attn_{attn}_logit_{logit}_first_{first}_poscond_{poscond}_repcond_{repcond}_btrain_{balanced_train}_btest_{balanced_test}"
 save_dir = os.path.join(base_save_dir, exp_name)
 results_dir = os.path.join(save_dir, "results")
 os.makedirs(results_dir, exist_ok=True)
@@ -65,7 +69,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"\nUsing device: {device}")
 
 
-np.random.seed(42)
+np.random.seed(seed)
 
 def upsample_class_fractional(
     indices,
@@ -159,9 +163,6 @@ def balance_samples_by_position(
 
 
 
-
-
-
 print("Loading saved dataset...")
 X_all = np.load(f"{dataset_path}/x.npy")
 y_all = np.load(f"{dataset_path}/y.npy")
@@ -171,9 +172,27 @@ lemma_all = np.load(f"{dataset_path}/cls.npy", allow_pickle=True)
 all_occ_list_all = np.load(f"{dataset_path}/cls.npy", allow_pickle=True)
 reps_all = np.load(f"{dataset_path}/repeats.npy", allow_pickle=True)
 
+if not first:
+    perm = np.random.permutation(len(y_all))
+    X_all = X_all[perm].copy()
+    y_all = y_all[perm].copy()
+    pos_all = pos_all[perm].copy()
+    cls_all = cls_all[perm].copy()
+    lemma_all = lemma_all[perm].copy()
+    all_occ_list_all = all_occ_list_all[perm].copy()
+    reps_all = reps_all[perm].copy()
 
+if not attn:
+    X_all[:, 1:-4] = np.random.randn(X_all.shape[0], 4*1024)
     
+if not logit:
+    X_all[:, -4:-1] = np.random.randn(X_all.shape[0], 3)
     
+if not repcond:
+    X_all[:, 0:1] = np.random.randn(X_all.shape[0], 1)
+    
+if not poscond:
+    X_all[:, -1:] = np.random.randn(X_all.shape[0], 1)
 
     
 reps_org = reps_all.copy()
@@ -221,7 +240,7 @@ if balanced_test:
         )
 
 
-
+print('sum', np.sum(y_test) / len(y_test))
 
 print(f"Train size: {len(y_train)} | TP={np.sum(y_train==1)}, FP={np.sum(y_train==0)}")
 print(f"Test size:  {len(y_test)} | TP={np.sum(y_test==1)}, FP={np.sum(y_test==0)}")
@@ -437,8 +456,11 @@ class BayesianMLPClassifier(nn.Module):
         # ----------------------------------
         # Bayesian correction
         # ----------------------------------
-        bayes_unnormalized = raw_posteriors * priors_rt
-
+        if balanced_train:
+            bayes_unnormalized = raw_posteriors * priors_rt
+        else:
+            bayes_unnormalized = raw_posteriors
+            
         bayes_posteriors = bayes_unnormalized / (
             bayes_unnormalized.sum(dim=1, keepdim=True) + 1e-8
         )
@@ -566,13 +588,10 @@ y_pred  = np.array(y_pred)
 y_true  = np.array(y_true)
 
 
-np.save(f"{results_dir}/y_probs_{target_rep}.npy", y_probs)
-np.save(f"{results_dir}/y_pred_{target_rep}.npy", y_pred)
-np.save(f"{results_dir}/y_true_{target_rep}.npy", y_true)
-np.save(f"{results_dir}/cls_test_{target_rep}.npy", cls_test)
-np.save(f"{results_dir}/pos_test_{target_rep}.npy", pos_test)
-np.save(f"{results_dir}/lemma_test_{target_rep}.npy", lemma_test)
+print(exp_name)
 
+print('FIRST')
+evaluate(y_true, y_pred, y_probs, cls_test, pos_test, results_dir=None)
 
 y_probs2 = []
 y_pred2 = []
@@ -580,6 +599,9 @@ y_true2 = []
 cls_test2 = []
 pos_test2 = []
 lemma_test2 = []
+
+
+
 
 for i, r in enumerate(reps_test):
     if r < 2:
@@ -593,12 +615,18 @@ for i, r in enumerate(reps_test):
         lemma_test2.append(lemma_test[i])
         
 target_rep = 2
-np.save(f"{results_dir}/y_probs_{target_rep}.npy", y_probs2)
-np.save(f"{results_dir}/y_pred_{target_rep}.npy", y_pred2)
-np.save(f"{results_dir}/y_true_{target_rep}.npy", y_true2)
-np.save(f"{results_dir}/cls_test_{target_rep}.npy", cls_test2)
-np.save(f"{results_dir}/pos_test_{target_rep}.npy", pos_test2)
-np.save(f"{results_dir}/lemma_test_{target_rep}.npy", lemma_test2)        
         
 
 
+print('NON-FIRST')
+evaluate(y_true2, y_pred2, y_probs2, cls_test2, pos_test2, results_dir=None)
+
+
+y_true = np.concatenate([y_true, y_true2])
+y_pred = np.concatenate([y_pred, y_pred2])
+y_probs = np.concatenate([y_probs, y_probs2])
+cls_test = np.concatenate([cls_test, cls_test2])
+pos_test = np.concatenate([pos_test, pos_test2])
+
+print('ALL')
+evaluate(y_true, y_pred, y_probs, cls_test, pos_test, results_dir=results_dir)
