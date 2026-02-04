@@ -6,10 +6,10 @@ import os
 sns.set_style('darkgrid')
 sns.set_palette('bright')
 
-f = np.load("data/f.npy")
+f = np.load("../data/f.npy")
 # Load data
-y = np.load("data/y.npy")[np.where(f)]
-rep = np.load("data/repeats.npy")[np.where(f)]
+y = np.load("../data/y.npy")[np.where(f)]
+rep = np.load("../data/repeats.npy")[np.where(f)]
 
 # Repetition values
 rep_values = np.array([1, 2, 3, 4])
@@ -46,7 +46,7 @@ os.makedirs(out_dir, exist_ok=True)
 out_path = os.path.join(out_dir, "prep_given_y.pdf")
 
 # Plot
-plt.figure(figsize=(5.4, 4))
+plt.figure(figsize=(5.4, 3.6))
 
 bar_width = 0.3
 x = np.arange(len(rep_values))
@@ -55,7 +55,7 @@ plt.bar(
     x - bar_width / 2,
     p_correct,
     width=bar_width,
-    color="green",
+    color="tab:blue",
     label="Correct"
 )
 
@@ -63,7 +63,7 @@ plt.bar(
     x + bar_width / 2,
     p_hall,
     width=bar_width,
-    color="red",
+    color="tab:red",
     label="Hallucinated"
 )
 
@@ -74,7 +74,7 @@ plt.xticks(
 )
 
 plt.xlabel("Repetition", fontsize=13)
-plt.ylabel(r"$p(\mathrm{rep} \mid y)$", fontsize=13)
+plt.ylabel(r"$p(\mathrm{r} \mid y)$", fontsize=13)
 plt.title(
     "Object Repetition Distribution",
     fontsize=14,

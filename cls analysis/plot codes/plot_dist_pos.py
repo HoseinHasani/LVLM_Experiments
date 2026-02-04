@@ -6,9 +6,8 @@ import os
 sns.set_style('darkgrid')
 sns.set_palette('bright')
 
-# Load data
-pos = np.load("data/pos.npy")
-y = np.load("data/y.npy")
+pos = np.load("../data/pos.npy")
+y = np.load("../data/y.npy")
 
 def smooth(x, kernel=[0.2, 0.6, 0.2], k=10):
     x = x.copy()
@@ -23,23 +22,20 @@ def smooth_hist(values, bins):
     centers = 0.5 * (edges[:-1] + edges[1:])
     return centers, hist
 
-# Binning
 bins = np.arange(pos.min(), pos.max() + 2) - 0.5
 
 x_c, p_c = smooth_hist(pos[y == 1], bins)
 x_h, p_h = smooth_hist(pos[y == 0], bins)
 
-# Output path
 out_dir = "figs"
 os.makedirs(out_dir, exist_ok=True)
 out_path = os.path.join(out_dir, "pt_given_y.pdf")
 
-# Plot
 plt.figure(figsize=(6.5, 4))
-plt.plot(x_c, p_c, label="Correct objects", color="green", linewidth=2.5)
-plt.plot(x_h, p_h, label="Hallucinated objects", color="red", linewidth=2.5)
+plt.plot(x_c, p_c, label="Correct", color="blue", linewidth=2.5)
+plt.plot(x_h, p_h, label="Hallucinated", color="red", linewidth=2.5)
 
-plt.xlabel("Token position $t$", fontsize=14)
+plt.xlabel("Token Position", fontsize=14)
 plt.ylabel(r"$p(t \mid y)$", fontsize=14)
 plt.title("Token Position Distribution", fontsize=14, fontweight="bold")
 plt.legend(fontsize=14)

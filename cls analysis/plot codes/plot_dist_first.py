@@ -7,9 +7,9 @@ sns.set_style('darkgrid')
 sns.set_palette('bright')
 
 # Load data
-pos = np.load("data/pos.npy")
-y = np.load("data/y.npy")
-f = np.load("data/f.npy")  # 1 = first occurrence, 0 = non-first
+pos = np.load("../data/pos.npy")
+y = np.load("../data/y.npy")
+f = np.load("../data/f.npy")  # 1 = first occurrence, 0 = non-first
 
 def smooth(x, kernel=[0.2, 0.6, 0.2], k=10):
     x = x.copy()
@@ -49,11 +49,11 @@ out_path = os.path.join(out_dir, "pr1_given_y_t.pdf")
 
 # Plot
 plt.figure(figsize=(6.5, 4))
-plt.plot(x_c, p_c, label="Correct", color="green", linewidth=2.5)
+plt.plot(x_c, p_c, label="Correct", color="blue", linewidth=2.5)
 plt.plot(x_h, p_h, label="Hallucinated", color="red", linewidth=2.5)
 
 plt.xlabel("Token Position", fontsize=15)
-plt.ylabel(r"$p(r = 1 \mid y, t)$", fontsize=15)
+plt.ylabel(r"$p(o = \text{first} \mid y, t)$", fontsize=15)
 plt.title(
     "First Occurrence Probability",
     fontsize=14,

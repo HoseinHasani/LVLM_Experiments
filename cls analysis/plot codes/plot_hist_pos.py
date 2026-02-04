@@ -13,8 +13,8 @@ plt.rcParams.update({
 })
 
 # Load data
-pos = np.load("data/pos.npy")
-y = np.load("data/y.npy")
+pos = np.load("../data/pos.npy")
+y = np.load("../data/y.npy")
 
 # Split by class
 pos_correct = pos[y == 1]
@@ -31,7 +31,7 @@ plt.hist(
     density=True,
     alpha=0.6,
     label="Correct (y=1)",
-    color="green"
+    color="blue"
 )
 
 plt.hist(
